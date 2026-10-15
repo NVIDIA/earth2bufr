@@ -1107,30 +1107,55 @@ fn extract_dx_tables(messages: &[BufrMessage], dx_indices: &[usize]) -> Result<T
 // =============================================================================
 
 /// Expand descriptors recursively using Table D.
+///
+/// `messages` are the source messages the expansion is for. Marker operators
+/// 2-23-255, 2-24-255, 2-25-255 and 2-32-255 each read one value of the
+/// element a data-present bitmap points at, so the expansion reads the bitmap
+/// from them. `None` expands the template alone, without any marker values.
 fn expand_descriptors(
     descriptors: &[u32],
     tables: &TableSet,
     strict: bool,
     fixed_replication: FixedReplicationLayout,
+    messages: Option<&[&BufrMessage]>,
 ) -> Result<Vec<ExpandedItem>, String> {
     let descriptors = message_type_template(descriptors, tables);
+    let mut scope = ExpansionScope {
+        messages,
+        bitmap: BitmapTracker::default(),
+        depth: 0,
+        delayed: 0,
+        markers: 0,
+    };
+    let mut result = Vec::new();
     expand_descriptors_inner(
         descriptors,
         tables,
         &mut OperatorState::default(),
         strict,
         fixed_replication == FixedReplicationLayout::Structural,
-    )
+        &mut scope,
+        &mut result,
+    )?;
+    if let Some(messages) = scope.messages {
+        verify_bitmaps(&scope.bitmap.resolved, &result, messages)?;
+    }
+    Ok(result)
 }
 
-fn expand_replicated_group(
+/// Expand one repetition of a replication group into `result`, bounding how
+/// deeply replications nest.
+#[allow(clippy::too_many_arguments)]
+fn expand_replicated(
     replication: u32,
     group: &[u32],
     tables: &TableSet,
     state: &mut OperatorState,
     strict: bool,
     structural_fixed_replication: bool,
-) -> Result<Vec<ExpandedItem>, String> {
+    scope: &mut ExpansionScope<'_>,
+    result: &mut Vec<ExpandedItem>,
+) -> Result<(), String> {
     if state.replication_depth >= MAX_REPLICATION_DEPTH {
         return Err(format!(
             "Replication {} is nested more than {MAX_REPLICATION_DEPTH} levels deep; \
@@ -1139,8 +1164,15 @@ fn expand_replicated_group(
         ));
     }
     state.replication_depth += 1;
-    let expanded =
-        expand_descriptors_inner(group, tables, state, strict, structural_fixed_replication);
+    let expanded = expand_descriptors_inner(
+        group,
+        tables,
+        state,
+        strict,
+        structural_fixed_replication,
+        scope,
+        result,
+    );
     state.replication_depth -= 1;
     expanded
 }
@@ -1162,10 +1194,11 @@ fn expand_descriptors_inner(
     state: &mut OperatorState,
     strict: bool,
     structural_fixed_replication: bool,
-) -> Result<Vec<ExpandedItem>, String> {
+    scope: &mut ExpansionScope<'_>,
+    result: &mut Vec<ExpandedItem>,
+) -> Result<(), String> {
     let mut inlined: Vec<u32>;
     let mut descriptors = descriptors;
-    let mut result = Vec::new();
     let mut i = 0;
 
     while i < descriptors.len() {
@@ -1270,14 +1303,18 @@ fn expand_descriptors_inner(
                         })?;
 
                     let group_descs = &descriptors[i + 2..i + 2 + num_following];
-                    let expanded_group = expand_replicated_group(
+                    scope.delayed += 1;
+                    let expanded_group = expand_group(
                         desc,
                         group_descs,
                         tables,
                         state,
                         strict,
                         structural_fixed_replication,
-                    )?;
+                        scope,
+                    );
+                    scope.delayed -= 1;
+                    let expanded_group = expanded_group?;
 
                     result.push(ExpandedItem::DelayedReplication {
                         factor_desc,
@@ -1295,23 +1332,72 @@ fn expand_descriptors_inner(
                         ));
                     }
                     let group = &descriptors[i + 1..i + 1 + num_following];
-                    let expanded_group = expand_replicated_group(
-                        desc,
-                        group,
-                        tables,
-                        state,
-                        strict,
-                        structural_fixed_replication,
-                    )?;
+                    let markers_before = scope.markers;
                     if structural_fixed_replication {
-                        result.push(ExpandedItem::FixedReplication {
-                            descriptor: desc,
-                            count: replication_count,
-                            group: expanded_group,
-                        });
+                        let expanded_group = expand_group(
+                            desc,
+                            group,
+                            tables,
+                            state,
+                            strict,
+                            structural_fixed_replication,
+                            scope,
+                        )?;
+                        if scope.markers == markers_before {
+                            result.push(ExpandedItem::FixedReplication {
+                                descriptor: desc,
+                                count: replication_count,
+                                group: expanded_group,
+                            });
+                        } else {
+                            // Each repetition of marker operators reads a different
+                            // element, so the repetitions cannot share one group.
+                            result.extend(expanded_group);
+                            scope.depth += 1;
+                            for _ in 1..replication_count {
+                                expand_replicated(
+                                    desc,
+                                    group,
+                                    tables,
+                                    state,
+                                    strict,
+                                    structural_fixed_replication,
+                                    scope,
+                                    result,
+                                )?;
+                            }
+                            scope.depth -= 1;
+                        }
                     } else {
-                        for _ in 0..replication_count {
-                            result.extend(expanded_group.clone());
+                        let start = result.len();
+                        expand_replicated(
+                            desc,
+                            group,
+                            tables,
+                            state,
+                            strict,
+                            structural_fixed_replication,
+                            scope,
+                            result,
+                        )?;
+                        if scope.markers == markers_before {
+                            let repeated = result[start..].to_vec();
+                            for _ in 1..replication_count {
+                                result.extend(repeated.iter().cloned());
+                            }
+                        } else {
+                            for _ in 1..replication_count {
+                                expand_replicated(
+                                    desc,
+                                    group,
+                                    tables,
+                                    state,
+                                    strict,
+                                    structural_fixed_replication,
+                                    scope,
+                                    result,
+                                )?;
+                            }
                         }
                     }
                     i += 1 + num_following;
@@ -1396,13 +1482,16 @@ fn expand_descriptors_inner(
                             state.increase_scale_width_y = y;
                         }
                     }
+                    23 | 24 | 25 | 32 if y == 255 => {
+                        expand_bitmap_marker(desc, result, scope)?;
+                    }
                     _ if !operator_leaves_bits_unchanged(x, y) => {
-                        return Err(format!(
-                            "Unsupported operator {}: it changes the Section 4 bits that follow",
-                            descriptor_to_string(desc)
-                        ));
+                        return Err(unsupported_bit_operator(desc));
                     }
                     _ => {
+                        scope
+                            .bitmap
+                            .observe(x, y, result.len(), scope.depth, scope.delayed);
                         if strict {
                             return Err(format!(
                                 "Unsupported operator {} in strict mode",
@@ -1448,7 +1537,360 @@ fn expand_descriptors_inner(
         }
     }
 
-    Ok(result)
+    Ok(())
+}
+
+/// Expand the descriptors of a replication group into their own items.
+fn expand_group(
+    replication: u32,
+    descriptors: &[u32],
+    tables: &TableSet,
+    state: &mut OperatorState,
+    strict: bool,
+    structural_fixed_replication: bool,
+    scope: &mut ExpansionScope<'_>,
+) -> Result<Vec<ExpandedItem>, String> {
+    let mut group = Vec::new();
+    scope.depth += 1;
+    let expanded = expand_replicated(
+        replication,
+        descriptors,
+        tables,
+        state,
+        strict,
+        structural_fixed_replication,
+        scope,
+        &mut group,
+    );
+    scope.depth -= 1;
+    expanded?;
+    Ok(group)
+}
+
+fn unsupported_bit_operator(desc: u32) -> String {
+    format!(
+        "Unsupported operator {}: it changes the Section 4 bits that follow",
+        descriptor_to_string(desc)
+    )
+}
+
+/// Descriptor 0-31-031, the data-present indicator that makes up a bitmap.
+const DATA_PRESENT_INDICATOR: u32 = 31 << 8 | 31;
+
+/// State shared by the nested calls of one descriptor expansion.
+struct ExpansionScope<'a> {
+    /// Source messages whose Section 4 holds the bitmaps of marker operators.
+    messages: Option<&'a [&'a BufrMessage]>,
+    bitmap: BitmapTracker,
+    /// Replication group vectors the expansion is building inside of.
+    depth: usize,
+    /// Delayed replications the expansion is inside of.
+    delayed: usize,
+    /// Marker operators expanded so far.
+    markers: usize,
+}
+
+/// The data-present bitmap a marker operator reads from, as 2-36-000, 2-37-000,
+/// 2-35-000 and 2-37-255 define, restart and cancel it.
+#[derive(Default)]
+struct BitmapTracker {
+    current: Option<ActiveBitmap>,
+    /// Bitmaps read from the data, to check against every message and subset.
+    resolved: Vec<ResolvedBitmap>,
+}
+
+struct ActiveBitmap {
+    /// Number of expanded items before the bitmap's data-present indicators.
+    defined_at: usize,
+    /// Whether the bitmap is outside every replication, where its position in
+    /// the expanded items is the same in every subset.
+    top_level: bool,
+    /// The next bitmap position a marker operator looks at.
+    cursor: usize,
+    /// Index into `BitmapTracker::resolved` once a marker operator needs the bits.
+    resolved: Option<usize>,
+}
+
+struct ResolvedBitmap {
+    defined_at: usize,
+    /// Expanded items that hold the data-present indicators.
+    indicator_items: usize,
+    indicators: Vec<Arc<TableBEntry>>,
+    /// The Table B elements the bitmap points at, one per indicator.
+    targets: Vec<Arc<TableBEntry>>,
+    /// Whether each target is present: its data-present indicator is zero.
+    present: Vec<bool>,
+}
+
+impl BitmapTracker {
+    fn observe(&mut self, x: u32, y: u32, items: usize, depth: usize, delayed: usize) {
+        match (x, y) {
+            (36, 0) => {
+                self.current = Some(ActiveBitmap {
+                    defined_at: items,
+                    top_level: depth == 0 && delayed == 0,
+                    cursor: 0,
+                    resolved: None,
+                });
+            }
+            (37, 0) => {
+                if let Some(active) = &mut self.current {
+                    active.cursor = 0;
+                }
+            }
+            (35, 0) | (37, 255) => self.current = None,
+            _ => {}
+        }
+    }
+}
+
+const BITMAP_DIFFERS: &str = "The data-present bitmap differs between subsets or messages, \
+    but marker operators need one bitmap for the whole batch";
+
+/// Expand a 2-23-255, 2-24-255, 2-25-255 or 2-32-255 marker into the value it
+/// stores: one value of the next element the bitmap marks present, with that
+/// element's width, scale and reference value (2-25-255 stores a difference one
+/// bit wider, from a reference value of -2^width).
+fn expand_bitmap_marker(
+    desc: u32,
+    result: &mut Vec<ExpandedItem>,
+    scope: &mut ExpansionScope<'_>,
+) -> Result<(), String> {
+    let missing_bitmap = |reason: &str| format!("{} ({reason})", unsupported_bit_operator(desc));
+    let Some(active) = scope.bitmap.current.as_mut() else {
+        return Err(missing_bitmap(
+            "no data-present bitmap is defined before it",
+        ));
+    };
+    if !active.top_level {
+        return Err(missing_bitmap("its bitmap lies inside a replication"));
+    }
+    if scope.delayed > 0 {
+        return Err(missing_bitmap("it lies inside a delayed replication"));
+    }
+    scope.markers += 1;
+    let Some(messages) = scope.messages.and_then(|messages| messages.first()) else {
+        // Without data the bitmap is unknown, so the markers' values are too.
+        return Ok(());
+    };
+    let index = match active.resolved {
+        Some(index) => index,
+        None => {
+            let resolved = resolve_bitmap(result, active.defined_at, messages)?;
+            scope.bitmap.resolved.push(resolved);
+            active.resolved = Some(scope.bitmap.resolved.len() - 1);
+            scope.bitmap.resolved.len() - 1
+        }
+    };
+    let bitmap = &scope.bitmap.resolved[index];
+    let position = (active.cursor..bitmap.present.len())
+        .find(|position| bitmap.present[*position])
+        .ok_or_else(|| missing_bitmap("the bitmap has no further element marked present for it"))?;
+    active.cursor = position + 1;
+
+    let target = &bitmap.targets[position];
+    let mut entry = (**target).clone();
+    entry.mnemonic = format!(
+        "{}_{}",
+        target.mnemonic,
+        descriptor_to_string(desc).replace('-', "")
+    )
+    .into();
+    entry.name = format!("{} ({} marker)", target.name, descriptor_to_string(desc));
+    if (desc >> 8) & 0x3F == 25 {
+        if entry.bit_width >= 63 {
+            return Err(missing_bitmap("its element is too wide for a difference"));
+        }
+        entry.reference_value = -(1i64 << entry.bit_width);
+        entry.bit_width += 1;
+    }
+    result.push(ExpandedItem::Descriptor(desc, Arc::new(entry)));
+    Ok(())
+}
+
+/// Read the bitmap that starts at `defined_at` from the first subset of
+/// `message`, and find the elements it points at.
+fn resolve_bitmap(
+    items: &[ExpandedItem],
+    defined_at: usize,
+    message: &BufrMessage,
+) -> Result<ResolvedBitmap, String> {
+    let mut indicators = Vec::new();
+    let mut indicator_items = 0;
+    for item in &items[defined_at..] {
+        let before = indicators.len();
+        collect_indicators(item, &mut indicators);
+        if indicators.len() == before {
+            break;
+        }
+        indicator_items += 1;
+    }
+    if indicators.is_empty() {
+        return Err("A bitmap operator is not followed by data-present indicators".into());
+    }
+    let mut targets = Vec::new();
+    collect_bitmap_targets(&items[..defined_at], indicators.len(), &mut targets)?;
+    if targets.len() < indicators.len() {
+        return Err("The data-present bitmap is longer than the elements before it".into());
+    }
+    targets.reverse();
+    let present = read_bitmap(
+        message,
+        items,
+        defined_at,
+        indicator_items,
+        &indicators,
+        false,
+    )?
+    .swap_remove(0);
+    Ok(ResolvedBitmap {
+        defined_at,
+        indicator_items,
+        indicators,
+        targets,
+        present,
+    })
+}
+
+/// Append the 0-31-031 indicators `item` stands for, or nothing if it stands
+/// for anything else.
+fn collect_indicators(item: &ExpandedItem, indicators: &mut Vec<Arc<TableBEntry>>) {
+    match item {
+        ExpandedItem::Descriptor(DATA_PRESENT_INDICATOR, entry) => {
+            indicators.push(Arc::clone(entry));
+        }
+        ExpandedItem::FixedReplication { count, group, .. } => {
+            let mut once = Vec::new();
+            let mut only_indicators = true;
+            for member in group {
+                let before = once.len();
+                collect_indicators(member, &mut once);
+                only_indicators &= once.len() > before;
+            }
+            if only_indicators {
+                for _ in 0..*count {
+                    indicators.extend(once.iter().cloned());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect, last first, the `count` Table B elements at the end of `items`.
+fn collect_bitmap_targets(
+    items: &[ExpandedItem],
+    count: usize,
+    targets: &mut Vec<Arc<TableBEntry>>,
+) -> Result<(), String> {
+    for item in items.iter().rev() {
+        if targets.len() == count {
+            break;
+        }
+        match item {
+            ExpandedItem::Descriptor(descriptor, entry) if descriptor >> 14 == 0 => {
+                targets.push(Arc::clone(entry));
+            }
+            ExpandedItem::Descriptor(..) => {}
+            ExpandedItem::FixedReplication {
+                count: repeats,
+                group,
+                ..
+            } => {
+                for _ in 0..*repeats {
+                    collect_bitmap_targets(group, count, targets)?;
+                }
+            }
+            ExpandedItem::DelayedReplication { .. } => {
+                return Err(
+                    "A data-present bitmap over a delayed replication is not supported".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read which elements a bitmap marks present, for the first subset of
+/// `message` or for each of its subsets. A compressed message has one answer,
+/// which every subset must share.
+fn read_bitmap(
+    message: &BufrMessage,
+    items: &[ExpandedItem],
+    defined_at: usize,
+    indicator_items: usize,
+    indicators: &[Arc<TableBEntry>],
+    every_subset: bool,
+) -> Result<Vec<Vec<bool>>, String> {
+    let parsed = parse_message(message)?;
+    let policy = ReadPolicy {
+        strict: false,
+        reject_overrun: false,
+    };
+    let mut reader = BitReader::with_policy(parsed.data, policy);
+    if parsed.is_compressed {
+        let subsets = parsed.num_subsets as usize;
+        for item in &items[..defined_at] {
+            skip_compressed_item(&mut reader, item, subsets)?;
+        }
+        let mut present = Vec::with_capacity(indicators.len());
+        for entry in indicators {
+            let reference = reader.read_bits(entry.bit_width);
+            let increment_bits = reader.read_bits(6) as u32;
+            let first = reader.read_bits(increment_bits);
+            for _ in 1..subsets {
+                if reader.read_bits(increment_bits) != first {
+                    return Err(BITMAP_DIFFERS.into());
+                }
+            }
+            present.push(reference.wrapping_add(first) == 0);
+        }
+        return Ok(vec![present]);
+    }
+    let subsets = if every_subset { parsed.num_subsets } else { 1 };
+    let mut bitmaps = Vec::with_capacity(subsets as usize);
+    for _ in 0..subsets {
+        for item in &items[..defined_at] {
+            skip_expanded_item(&mut reader, item)?;
+        }
+        bitmaps.push(
+            indicators
+                .iter()
+                .map(|entry| reader.read_bits(entry.bit_width) == 0)
+                .collect(),
+        );
+        if every_subset {
+            for item in &items[defined_at + indicator_items..] {
+                skip_expanded_item(&mut reader, item)?;
+            }
+        }
+    }
+    Ok(bitmaps)
+}
+
+/// Check that every message and subset of the batch carries the bitmaps the
+/// expansion read from the first subset.
+fn verify_bitmaps(
+    bitmaps: &[ResolvedBitmap],
+    items: &[ExpandedItem],
+    messages: &[&BufrMessage],
+) -> Result<(), String> {
+    for bitmap in bitmaps {
+        for message in messages {
+            let found = read_bitmap(
+                message,
+                items,
+                bitmap.defined_at,
+                bitmap.indicator_items,
+                &bitmap.indicators,
+                true,
+            )?;
+            if found.iter().any(|present| *present != bitmap.present) {
+                return Err(BITMAP_DIFFERS.into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether an operator this decoder does not apply occupies no Section 4 bits
@@ -2664,8 +3106,8 @@ fn skip_expanded_item(reader: &mut BitReader, item: &ExpandedItem) -> Result<(),
         ExpandedItem::Descriptor(_, entry) => {
             reader.skip_bits(entry.bit_width);
         }
-        ExpandedItem::FixedReplication { .. } => {
-            unreachable!("flat expansion inlines fixed replication")
+        ExpandedItem::FixedReplication { count, group, .. } => {
+            skip_replication(reader, group, *count)?;
         }
         ExpandedItem::DelayedReplication {
             factor_entry,
@@ -6208,6 +6650,7 @@ fn decode_structural_bounded_group(
         group.tables,
         options.policy.strict,
         FixedReplicationLayout::Structural,
+        Some(&group.messages),
     )?;
     let mut schema = derive_structural_schema(&expanded, None);
     let present;
@@ -6299,6 +6742,7 @@ fn decode_bounded_group(
         group.tables,
         options.policy.strict,
         FixedReplicationLayout::Flat,
+        Some(&group.messages),
     )?;
     append_data_category(&mut expanded);
     let mut schema = derive_schema(&expanded);
@@ -7360,11 +7804,16 @@ impl BufrFileHandle {
         )
         .map_err(PyValueError::new_err)?;
 
+        let messages = self
+            .state
+            .read_messages(&[source_message_index])
+            .map_err(PyValueError::new_err)?;
         let expanded = expand_descriptors(
             &descriptors,
             tables,
             self.state.strict,
             FixedReplicationLayout::Flat,
+            Some(&messages.iter().collect::<Vec<_>>()),
         )
         .map_err(PyValueError::new_err)?;
         let mut effective_occurrences = Vec::new();
@@ -7653,6 +8102,7 @@ fn open_indexed(
                     tables,
                     true,
                     FixedReplicationLayout::Flat,
+                    None,
                 )
                 .map_err(|error| format!("Strict BUFR template validation failed: {error}"))?;
             }

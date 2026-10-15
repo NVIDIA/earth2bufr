@@ -262,9 +262,8 @@ with earth2bufr.open_bufr(path, strict=True) as source:
 
 Operators the decoder does not apply fail in both modes when they read Section 4
 bits or change the widths of later elements: `2-03-YYY` reference value
-definitions (YYY > 0) and `2-03-255`, `2-08`, `2-09`, `2-21`, the
-`2-23-255`, `2-24-255`, `2-25-255` and `2-32-255` markers, and any other
-operator outside the list below. Permissive decoding skips `2-22-000` to
+definitions (YYY > 0) and `2-03-255`, `2-08`, `2-09`, `2-21`, and any other
+operator outside the lists below. Permissive decoding skips `2-22-000` to
 `2-25-000`, `2-32-000`, `2-35-000`, `2-36-000`, `2-37-000`, `2-37-255`,
 `2-41-000`, `2-41-255`, `2-42-000` and `2-42-255`, which occupy no bits; the
 bitmaps and values they announce decode as ordinary columns. Strict decoding
@@ -276,6 +275,18 @@ is a malformed table: it raises `ValueError` in both modes, naming the sequence
 or replication descriptor (at open time under `strict=True`, otherwise at the
 first message that uses it). Expansion stops after 100,000 inlined sequences or
 64 nested replications.
+
+The `2-23-255`, `2-24-255`, `2-25-255` and `2-32-255` markers each carry one
+value of the next element that a data-present bitmap (`2-36-000` followed by
+`0-31-031` indicators) marks present, packed like that element (`2-25-255`
+carries a difference one bit wider). Permissive decoding reads them as columns
+named after the element and the marker, such as `B012063_224255`; strict decoding
+rejects the bitmap operator that defines their bitmap.
+`2-37-000` restarts the bitmap and `2-35-000` or `2-37-255` cancels it. A
+marker needs one bitmap for the whole batch, read from the first subset: decoding
+fails if later subsets or messages in the batch mark other elements present, if
+no bitmap is defined before the marker, or if the bitmap or marker lies inside a
+replication.
 
 When Section 3 starts with a sequence that the embedded DX tables name as a
 Table A message type, that sequence alone describes the data, as NCEPLIBS-bufr

@@ -1504,6 +1504,7 @@ def _operator_message(operator: tuple[int, int, int]) -> bytes:
 
 
 # Operators that read bits from Section 4 or change the widths of later elements, and unassigned 2-10.
+# The 2-2x-255 markers are listed because _operator_message defines no bitmap for them to read.
 BIT_CHANGING_OPERATORS = [
     (2, 3, 8),
     (2, 3, 255),

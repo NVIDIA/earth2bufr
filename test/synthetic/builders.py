@@ -891,6 +891,89 @@ def build_quality_bitmap_message() -> bytes:
     return bufr_message(descriptors, writer.to_bytes(), num_subsets=1)
 
 
+BITMAP_MARKER_KEYS = {
+    23: "substitutedValue",
+    24: "firstOrderStatisticalValue",
+    25: "differenceStatisticalValue",
+    32: "replacedRetainedValue",
+}
+# The bitmap marks air temperature (16 bits, scale 2) and wind speed (12 bits, scale 1) as present.
+BITMAP_MARKER_FIELDS = (AIR_TEMPERATURE, WIND_SPEED)
+BITMAP_MARKER_BITS = (1, 0, 0)  # year, air temperature, wind speed: 0 marks an element as present
+
+
+def bitmap_marker_raw(subset: int, repeat: int, marker: int) -> int:
+    """Return the raw code of marker ``marker`` in bitmap pass ``repeat`` of ``subset``."""
+    return (100, 200)[marker] + 10 * subset + 3 * repeat
+
+
+def bitmap_marker_value(operator: int, subset: int, repeat: int, marker: int) -> float:
+    """Return the physical value of a marker; 2-25-255 sets the reference value to ``-2**width``."""
+    field = BITMAP_MARKER_FIELDS[marker]
+    raw = bitmap_marker_raw(subset, repeat, marker)
+    if operator == 25:
+        raw -= 1 << field.bit_width
+    return raw / 10**field.scale
+
+
+def build_bitmap_marker_message(
+    operator: int, *, compressed: bool = False, num_subsets: int = 1, passes: int = 1
+) -> bytes:
+    """Build values, a data-present bitmap, then ``2-<operator>-255`` markers for the elements it marks.
+
+    The bitmap covers year, air temperature and wind speed, and marks the last two
+    as present, so each pass holds two markers of 16 and 12 bits (one more for
+    2-25-255). A second pass repeats the markers after 2-37-000, which restarts
+    the bitmap.
+    """
+    extra = 1 if operator == 25 else 0
+    marker = desc(2, operator, 255)
+    pass_descriptors = [marker, marker]
+    descriptors = [
+        YEAR.descriptor,
+        AIR_TEMPERATURE.descriptor,
+        WIND_SPEED.descriptor,
+        desc(2, 36, 0),
+        desc(0, 31, 31),
+        desc(0, 31, 31),
+        desc(0, 31, 31),
+        *pass_descriptors,
+    ]
+    for _ in range(passes - 1):
+        descriptors += [desc(2, 37, 0), *pass_descriptors]
+
+    # One (raw code, width) entry per element of the template, per subset.
+    rows: list[list[tuple[int, int]]] = []
+    for subset in range(num_subsets):
+        row = [
+            (YEAR.encode_raw(2024 + subset), YEAR.bit_width),
+            (AIR_TEMPERATURE.encode_raw(281.5 + subset), AIR_TEMPERATURE.bit_width),
+            (WIND_SPEED.encode_raw(3.5 + subset), WIND_SPEED.bit_width),
+            *[(bit, 1) for bit in BITMAP_MARKER_BITS],
+        ]
+        for repeat in range(passes):
+            for index, field in enumerate(BITMAP_MARKER_FIELDS):
+                row.append((bitmap_marker_raw(subset, repeat, index), field.bit_width + extra))
+        rows.append(row)
+
+    writer = BitWriter()
+    if compressed:
+        for column in zip(*rows, strict=True):
+            raws = [raw for raw, _ in column]
+            width = column[0][1]
+            reference = min(raws)
+            increment_bits = max(raw - reference for raw in raws).bit_length()
+            writer.write_bits(reference, width)
+            writer.write_bits(increment_bits, 6)
+            for raw in raws:
+                writer.write_bits(raw - reference, increment_bits)
+    else:
+        for row in rows:
+            for raw, width in row:
+                writer.write_bits(raw, width)
+    return bufr_message(descriptors, writer.to_bytes(), num_subsets=num_subsets, compressed=compressed)
+
+
 def _write_compressed_numeric_values(writer: BitWriter, field: WmoField, values: Sequence[Any]) -> None:
     raw_values = [field.encode_raw(value) for value in values]
     missing = (1 << field.bit_width) - 1

@@ -34,6 +34,7 @@ columns. Assertion failures include the fixture descriptor list and expected row
 | `wmo_code_flag_combined_operator_exemption` | Active `2-07` spanning code, flag, and numeric fields | ecCodes | Combined numeric packing changes do not affect code/flag descriptors |
 | `wmo_delayed_replication_levels` | Delayed replication of pressure/temperature levels | ecCodes, PyBufrKit | Nested list structure consistency |
 | `wmo_quality_bitmap_operators` | `2-22-000` and `2-36-000` bitmap with confidence values, `2-37-000`/`2-37-255` bitmap reuse, then a wind speed | ecCodes | Operators without data bits leave later values aligned |
+| `wmo_bitmap_marker_operators` | `2-23-255`, `2-24-255`, `2-25-255` and `2-32-255` markers after a `2-36-000` bitmap, uncompressed and compressed, two subsets, bitmap reused with `2-37-000` | ecCodes | Marker values come from the element the bitmap points at, with its width, scale and reference value |
 
 The code/flag operator fixtures use ecCodes only; PyBufrKit 0.2.25 compares code/flag units case-sensitively against its bundled tables.
 

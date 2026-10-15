@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 from . import adapters
 from .assertions import assert_nested_rows_match, assert_reference_frames_match
 from .builders import (
+    BITMAP_MARKER_KEYS,
+    bitmap_marker_value,
+    build_bitmap_marker_message,
     build_code_flag_combined_operator_message,
     build_code_flag_operator_message,
     build_quality_bitmap_message,
@@ -148,6 +151,38 @@ def test_wmo_quality_bitmap_operators_match_eccodes(tmp_path: Path):
         ("B033007", 90.0),
         ("B011002", 3.5),
     ]
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["uncompressed", "compressed"])
+@pytest.mark.parametrize("operator", sorted(BITMAP_MARKER_KEYS), ids=lambda operator: f"2-{operator:02d}-255")
+def test_wmo_bitmap_marker_operators_match_eccodes(tmp_path: Path, operator: int, compressed: bool):
+    """Marker operators with YYY=255 read the element the bitmap points at, as ecCodes does."""
+    import earth2bufr
+
+    path = tmp_path / "bitmap_marker.bufr"
+    path.write_bytes(build_bitmap_marker_message(operator, compressed=compressed, num_subsets=2, passes=2))
+    key = BITMAP_MARKER_KEYS[operator]
+    reference = _decode_reference("ecCodes", adapters.decode_eccodes_keys, path, [key])[key]
+    expected = [
+        [bitmap_marker_value(operator, subset, repeat, marker) for repeat in range(2) for marker in range(2)]
+        for subset in range(2)
+    ]
+    # ecCodes lists uncompressed values subset by subset and compressed values marker by marker.
+    if compressed:
+        reference_rows = [reference[subset::2] for subset in range(2)]
+    else:
+        reference_rows = [reference[subset * 4 : (subset + 1) * 4] for subset in range(2)]
+    batch = next(iter(earth2bufr.read_bufr(path)))
+    suffix = f"_2{operator:02d}255"
+    markers = [name for name in batch.schema.names if name.endswith(suffix)]
+    rows = [
+        [batch.column(index)[subset].as_py() for index, name in enumerate(batch.schema.names) if name in markers]
+        for subset in range(2)
+    ]
+
+    assert reference_rows == [pytest.approx(row) for row in expected]
+    assert markers == [f"B012101{suffix}", f"B011002{suffix}"] * 2
+    assert rows == [pytest.approx(row) for row in expected]
 
 
 def test_satpy_adapter_reports_product_reader_limit_for_generic_wmo(tmp_path: Path):
