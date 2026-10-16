@@ -6,7 +6,7 @@
 project = "earth2bufr"
 copyright = "2025, NVIDIA CORPORATION & AFFILIATES"  # noqa: A001
 author = "NVIDIA"
-release = "0.1.0a0"
+release = "0.1.0rc1"
 
 extensions = [
     "myst_parser",
