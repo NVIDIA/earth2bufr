@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import pyarrow as pa
 
-__version__ = "0.1.0a0"
+__version__ = "0.2.0a0"
 
 # Path to bundled tables
 _TABLES_DIR = Path(__file__).parent / "tables"

@@ -548,7 +548,7 @@ wheels = [
 
 [[package]]
 name = "earth2bufr"
-version = "0.1.0a0"
+version = "0.2.0a0"
 source = { editable = "." }
 dependencies = [
     { name = "pyarrow" },
