@@ -1,0 +1,124 @@
+name: utils-create-rc
+
+# Manual release cut from main, restricted to maintainers and admins.
+#
+# main carries an X.Y.Za0 development version. This workflow:
+#   1. creates the X.Y.Z-rc branch from main with every version entry set to
+#      X.Y.ZrcN (X.Y.Z-rc.N for Cargo), and
+#   2. opens a pull request against main that bumps the development version
+#      to the next X.Y.Za0.
+# Wheels are built from the rc branch with the build-wheels workflow, which
+# drops the rc suffix and publishes X.Y.Z.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc-number:
+        description: Release candidate number (the N in X.Y.ZrcN)
+        type: string
+        default: "1"
+      next-version:
+        description: Next development version for main (X.Y.Za0). Defaults to the next minor.
+        type: string
+        default: ""
+      dry-run:
+        description: Only print the plan, do not push or open a pull request
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: create-rc
+  cancel-in-progress: false
+
+jobs:
+  create-rc:
+    name: Create rc branch and version bump PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RC_NUMBER: ${{ inputs.rc-number }}
+      NEXT_VERSION: ${{ inputs.next-version }}
+      DRY_RUN: ${{ inputs.dry-run }}
+      ACTOR: ${{ github.actor }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Require maintain or admin role
+        run: |
+          role=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .role_name)
+          echo "$ACTOR has role: $role"
+          case "$role" in
+            admin|maintain) ;;
+            *) echo "::error::Only maintainers and admins can cut a release"; exit 1 ;;
+          esac
+
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: echo "::error::Run this workflow from main"; exit 1
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Plan release
+        id: plan
+        run: |
+          python .github/scripts/bump_version.py plan --rc-number "$RC_NUMBER" --next-version "$NEXT_VERSION" | tee plan.env
+          cat plan.env >> "$GITHUB_OUTPUT"
+          rm plan.env
+
+      - name: Check branches are free
+        env:
+          RC_BRANCH: ${{ steps.plan.outputs.rc_branch }}
+          BUMP_BRANCH: bump-version-${{ steps.plan.outputs.next_version }}
+        run: |
+          for branch in "$RC_BRANCH" "$BUMP_BRANCH"; do
+            if git ls-remote --exit-code --heads origin "refs/heads/$branch" > /dev/null; then
+              echo "::error::Branch $branch already exists"; exit 1
+            fi
+          done
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create rc branch
+        env:
+          RC_BRANCH: ${{ steps.plan.outputs.rc_branch }}
+          RC_VERSION: ${{ steps.plan.outputs.rc_version }}
+        run: |
+          git checkout -b "$RC_BRANCH"
+          python .github/scripts/bump_version.py apply "$RC_VERSION"
+          git commit --signoff -am "Bump version to $RC_VERSION"
+          git show --stat HEAD
+          if [ "$DRY_RUN" != "true" ]; then
+            git push origin "HEAD:refs/heads/$RC_BRANCH"
+          fi
+
+      - name: Open version bump PR for main
+        env:
+          RC_BRANCH: ${{ steps.plan.outputs.rc_branch }}
+          RELEASE: ${{ steps.plan.outputs.release }}
+          NEXT: ${{ steps.plan.outputs.next_version }}
+        run: |
+          git checkout -b "bump-version-$NEXT" origin/main
+          python .github/scripts/bump_version.py apply "$NEXT"
+          git commit --signoff -am "Bump version to $NEXT"
+          git show --stat HEAD
+          if [ "$DRY_RUN" != "true" ]; then
+            git push origin "HEAD:refs/heads/bump-version-$NEXT"
+            gh pr create --base main --head "bump-version-$NEXT" \
+              --title "Bump version to $NEXT" \
+              --body "Start development of the next release after cutting \`$RC_BRANCH\` ($RELEASE)."
+          fi

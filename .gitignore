@@ -1,0 +1,51 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Rust/Cargo
+target/
+*.so
+*.dylib
+*.dll
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Documentation
+docs/_build/
+docs/superpowers/
+
+# ASV benchmarks
+benchmarks/.asv/
+
+# Test data (large binary files)
+examples/data/
+.test-data-cache/
+.benchmark-data-cache/
+data/**/*.bin
+data/**/*.bufr
+data/**/*.nr
+data/**/*.xml
+benchmarks/data/**/*.bin
+benchmarks/data/**/*.bufr
+benchmarks/data/**/*.nr
+benchmarks/data/**/*.xml
+
+# OS
+.DS_Store
+Thumbs.db

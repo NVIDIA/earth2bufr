@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "NVIDIA Earth2BUFR: A Rust-based BUFR decoder with Python bindings for Apache Arrow tables"
+type: software
+authors:
+  - name: "Earth2BUFR Contributors"
+repository-code: "https://github.com/NVIDIA/earth2bufr"
+license: Apache-2.0

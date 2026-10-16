@@ -1,0 +1,239 @@
+stages:
+  - lint
+  - build
+  - package
+  - test
+  - observe
+  - docs
+
+variables:
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  EARTH2BUFR_CI_IMAGE: "$CI_REGISTRY_IMAGE/ci:0.2"
+  EARTH2BUFR_FAIL_ON_SKIP: "1"
+
+# Cache package and compiler dependencies between runs
+.cache-template: &cache-template
+  cache:
+    key: "${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .uv-cache
+      - .cargo/registry
+      - .cargo/git
+
+.ci-runtime-template: &ci-runtime-template
+  image: $EARTH2BUFR_CI_IMAGE
+  <<: *cache-template
+  before_script:
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - uv python install 3.11
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+lint:release-automation:
+  stage: lint
+  tags: [docker]
+  image: python:3.11-slim
+  script:
+    - python -m pip install packaging
+    - python -m unittest discover -s .gitlab/ci -p 'test_*.py'
+
+lint:license:
+  stage: lint
+  tags:
+    - docker
+  image: python:3.11-slim
+  script:
+    - python test/_license/header_check.py
+
+lint:python:
+  stage: lint
+  tags:
+    - docker
+  <<: *ci-runtime-template
+  script:
+    - uv sync --group dev
+    - uv run ruff format --check .
+    - uv run ruff check .
+    - uv run interrogate
+
+lint:rust:
+  stage: lint
+  tags:
+    - docker
+  image: rust:latest
+  <<: *cache-template
+  before_script:
+    - rustup component add rustfmt clippy
+  script:
+    - cargo fmt --all -- --check
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+# ---------------------------------------------------------------------------
+# Build - Linux wheel (abi3 - works for Python 3.11+)
+# ---------------------------------------------------------------------------
+build:linux:
+  stage: build
+  tags:
+    - docker
+  image: ghcr.io/astral-sh/uv:debian
+  <<: *cache-template
+  before_script:
+    - apt-get update && apt-get install -y curl git build-essential
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - export PATH="$CARGO_HOME/bin:$PATH"
+  script:
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - uv tool run maturin build --release --out dist
+  artifacts:
+    paths:
+      - dist/*.whl
+    expire_in: 1 week
+
+# ---------------------------------------------------------------------------
+# Build - Windows wheels (cross-compilation from Linux using cargo-xwin)
+# Uses official Rust image + cargo-xwin for MSVC-compatible builds
+# ---------------------------------------------------------------------------
+.build-windows-template: &build-windows-template
+  stage: build
+  tags:
+    - docker
+  image: rust:latest
+  variables:
+    XWIN_CACHE_DIR: "$CI_PROJECT_DIR/.xwin-cache"
+  before_script:
+    - apt-get update && apt-get install -y python3 python3-pip python3-venv clang lld llvm
+    - pip3 install maturin --break-system-packages
+    - cargo install cargo-xwin
+    - rustup target add x86_64-pc-windows-msvc
+  artifacts:
+    paths:
+      - dist/*.whl
+    expire_in: 1 week
+  cache:
+    key: "${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cargo/registry
+      - .cargo/git
+      - .xwin-cache
+
+# Windows builds using abi3 (stable ABI) - single wheel works for py311+
+build:windows:abi3:
+  <<: *build-windows-template
+  script:
+    - maturin build --release --target x86_64-pc-windows-msvc --out dist
+
+.release-operation:
+  stage: .pre
+  tags: [docker]
+  image: python:3.11-slim
+  needs: []
+  allow_failure: true
+  before_script:
+    - python -m pip install packaging
+
+create-rc-branch:
+  extends: .release-operation
+  resource_group: create-rc-branch
+  variables:
+    RELEASE_BOT_EMAIL: ngeneva@nvidia.com
+  before_script:
+    - apt-get update && apt-get install -y git
+    - python -m pip install packaging
+  script:
+    - python .gitlab/ci/release.py create-rc
+  rules:
+    - if: '$CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH !~ /-rc$/'
+      when: manual
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+test:
+  stage: test
+  tags:
+    - docker
+  <<: *ci-runtime-template
+  script:
+    - uv sync --group dev --group test
+    - uv run maturin develop --release
+    # Keep SatPy/PROJ and the ecCodes binary wheel in separate processes.
+    - >-
+      uv run pytest --timeout=300 -rs -m "not slow"
+      --deselect=test/synthetic/test_wmo_cross_validation.py::test_satpy_adapter_reports_product_reader_limit_for_generic_wmo
+    - >-
+      uv run pytest --timeout=300 -rs
+      test/synthetic/test_wmo_cross_validation.py::test_satpy_adapter_reports_product_reader_limit_for_generic_wmo
+
+# Measure every main/RC push, even if an unrelated package job fails.
+observatory:
+  stage: observe
+  needs: []
+  inherit:
+    variables: false
+  variables:
+    UPSTREAM_SHA: $CI_COMMIT_SHA
+    UPSTREAM_BRANCH: $CI_COMMIT_BRANCH
+    UPSTREAM_PIPELINE_ID: $CI_PIPELINE_ID
+    UPSTREAM_PIPELINE_URL: $CI_PIPELINE_URL
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^\d+\.\d+\.\d+-rc$/i)'
+  trigger:
+    project: modulus/earth-2/earth2bufr-observatory
+    branch: main
+    strategy: depend
+
+# ---------------------------------------------------------------------------
+# Documentation & GitLab Pages
+# ---------------------------------------------------------------------------
+pages:
+  stage: docs
+  tags:
+    - docker
+  <<: *ci-runtime-template
+  script:
+    - uv sync --group dev --group docs
+    - uv run maturin develop --release
+    - uv run sphinx-build -b html docs public
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+
+# ---------------------------------------------------------------------------
+# Scans
+# ---------------------------------------------------------------------------
+test:sonar:
+  stage: test
+  tags:
+    - docker
+  image:
+    name: sonarsource/sonar-scanner-cli:11
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    policy: pull-push
+    key: "sonar-cache-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+      - sonar-scanner/
+  script:
+    - sonar-scanner -Dsonar.host.url="${SONAR_HOST_URL}"
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH =~ /^\d+\.\d+\.\d+-rc$/i'
+
+# ---------------------------------------------------------------------------
+# Shared release pipelines (release wheel build + smoke test, Artifactory push,
+# KitMaker publish) maintained in modulus-ci
+# ---------------------------------------------------------------------------
+include:
+  - project: 'modulus/modulus-ci'
+    ref: main
+    file: '.gitlab-ci/earth2bufr/common.gitlab-ci.yml'

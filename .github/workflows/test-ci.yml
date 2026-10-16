@@ -1,0 +1,171 @@
+name: test-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  automation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Test repository automation
+        run: node --test .github/scripts/close-aged.test.cjs
+      - name: Test release version script
+        run: python3 -m unittest discover -s .github/scripts -p "test_*.py"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.11
+          uv export --frozen --only-group dev --no-emit-project | uv pip install -r -
+
+      - name: License header check
+        run: python test/_license/header_check.py
+
+      - name: Ruff format check
+        run: uv run --no-sync ruff format --check .
+
+      - name: Ruff lint
+        run: uv run --no-sync ruff check .
+
+      - name: Interrogate (docstring coverage)
+        run: uv run --no-sync interrogate
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # zizmor: ignore[ref-version-mismatch] master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [lint]
+    env:
+      EARTH2BUFR_FAIL_ON_SKIP: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # zizmor: ignore[ref-version-mismatch] master
+        with:
+          toolchain: stable
+
+      - name: Build and install package
+        run: |
+          uv venv --python 3.11
+          uv export --frozen --no-default-groups --group dev --group test \
+            --no-emit-project | uv pip install -r -
+          uv run --no-sync maturin develop --release
+
+      # Golden files and real-instrument fixtures are validated only on GitLab.
+      - name: Run self-contained tests
+        run: >-
+          uv run --no-sync pytest --timeout=300 -rs -m "not slow"
+          --deselect=test/synthetic/test_wmo_cross_validation.py::test_satpy_adapter_reports_product_reader_limit_for_generic_wmo
+
+      # Keep SatPy/PROJ and the ecCodes binary wheel in separate processes.
+      - name: Run SatPy adapter check
+        run: >-
+          uv run --no-sync pytest --timeout=300 -rs
+          test/synthetic/test_wmo_cross_validation.py::test_satpy_adapter_reports_product_reader_limit_for_generic_wmo
+
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          retention-days: 7
+          if-no-files-found: error
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          retention-days: 7
+          if-no-files-found: error

@@ -1,0 +1,32 @@
+name: test-zizmor
+
+# Audits GitHub Actions workflows with zizmor. Findings are printed in the job
+# log and fail the job (zizmor exits non-zero when it reports findings).
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/**"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: Audit workflows
+    if: github.repository == 'NVIDIA/earth2bufr'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pipx run zizmor==1.29.0 --format=plain --no-progress .github/

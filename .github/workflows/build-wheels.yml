@@ -1,0 +1,205 @@
+name: build-wheels
+
+# Manual build of the release artifacts for any branch, restricted to
+# maintainers and admins. Each artifact is smoke tested after the build. The
+# artifacts that built are then signed keylessly with Sigstore (GitHub OIDC
+# identity of this workflow), verified, and stored in the `signed-release`
+# workflow artifact (a file and its .sigstore.json bundle for each of up to
+# five artifacts). The GitLab `push-wheel` job downloads a run by ID, verifies
+# the signatures again, and uploads to Artifactory.
+#
+# On an X.Y.Z-rc branch the wheels are built as X.Y.Z (the rc suffix dropped).
+
+on:
+  workflow_dispatch:
+    inputs:
+      linux-x86_64:
+        description: Build Linux x86_64 wheel
+        type: boolean
+        default: true
+      linux-arm64:
+        description: Build Linux arm64 wheel
+        type: boolean
+        default: true
+      windows-x86_64:
+        description: Build Windows x86_64 wheel
+        type: boolean
+        default: true
+      macos-arm64:
+        description: Build macOS arm64 wheel
+        type: boolean
+        default: true
+      sdist:
+        description: Build source distribution
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+  CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/build-wheels.yml@${{ github.ref }}
+
+jobs:
+  authorize:
+    name: Check maintainer access
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Require maintain or admin role
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          role=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .role_name)
+          echo "$ACTOR has role: $role"
+          case "$role" in
+            admin|maintain) ;;
+            *) echo "::error::Only maintainers and admins can build release artifacts"; exit 1 ;;
+          esac
+
+      - name: Select wheel platforms
+        id: matrix
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          all='[
+            {"name":"linux-x86_64","os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","manylinux":"auto"},
+            {"name":"linux-arm64","os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","manylinux":"auto"},
+            {"name":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","manylinux":"off"},
+            {"name":"macos-arm64","os":"macos-14","target":"aarch64-apple-darwin","manylinux":"off"}
+          ]'
+          matrix=$(jq -c --argjson inputs "$INPUTS" '[.[] | select($inputs[.name] == true)]' <<< "$all")
+          echo "Selected: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  wheel:
+    name: Wheel (${{ matrix.name }})
+    needs: authorize
+    if: needs.authorize.outputs.matrix != '[]'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.authorize.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Set release version
+        id: version
+        shell: bash
+        run: echo "version=$(python .github/scripts/release_version.py "$GITHUB_REF_NAME" --apply)" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: ${{ matrix.manylinux }}
+
+      - name: Smoke test wheel
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python .github/scripts/smoke_check.py wheel --dist dist --version "$VERSION"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-${{ matrix.name }}
+          path: dist/*.whl
+          retention-days: 1
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    needs: authorize
+    if: inputs.sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set release version
+        id: version
+        run: echo "version=$(python3 .github/scripts/release_version.py "$GITHUB_REF_NAME" --apply)" >> "$GITHUB_OUTPUT"
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Smoke test sdist
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python3 .github/scripts/smoke_check.py sdist --dist dist --version "$VERSION"
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-sdist
+          path: dist/*.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  sign:
+    name: Sign artifacts
+    needs: [wheel, sdist]
+    # Sign whatever built, even if another platform failed
+    if: ${{ !cancelled() && (needs.wheel.result == 'success' || needs.sdist.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download unsigned artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: unsigned-*
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -l dist
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Install sigstore
+        run: python -m pip install "sigstore==4.5.0"
+
+      # Keyless signing with the ambient GitHub OIDC token; writes
+      # <file>.sigstore.json next to each artifact
+      - name: Sign
+        run: sigstore sign dist/*
+
+      # Verify each bundle against this workflow's identity
+      - name: Verify signatures
+        run: |
+          for f in dist/*; do
+            case "$f" in *.sigstore.json) continue ;; esac
+            sigstore verify identity \
+              --cert-identity "$CERT_IDENTITY" \
+              --cert-oidc-issuer "$OIDC_ISSUER" \
+              "$f"
+          done
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-release
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
