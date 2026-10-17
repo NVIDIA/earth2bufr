@@ -95,7 +95,17 @@ with earth2bufr.open_bufr("crisf4.bufr") as source:
         consume_compact_spectra(batch)
 ```
 
-Matching entries keep source order, duplicates and list boundaries.
+Matching entries keep source order, duplicates and list boundaries. Filter
+values are physical values, also when the key is one of the `raw_code_paths`,
+so a channel subset can keep its radiances and channel numbers as raw codes:
+
+```python
+source.iter_batches(
+    projection=["SAID", "FORN", "FOVN", "DRF16BIT.CHNM", "DRF16BIT.SRAD"],
+    list_filters=[ListValueFilter(field="DRF16BIT", key="CHNM", values=channels)],
+    raw_code_paths=["DRF16BIT.CHNM", "DRF16BIT.SRAD"],
+)
+```
 
 A batch holds at most `messages_per_batch` data messages, in source order, and
 ends early where the data category, descriptor template, compression or table

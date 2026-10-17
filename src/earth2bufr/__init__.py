@@ -145,7 +145,9 @@ class ListValueFilter:
     key : str
         Numeric child used for matching, for example ``"CHNM"``.
     values : tuple of float
-        Exact finite values to retain. Source order and duplicates are kept.
+        Exact finite values to retain, compared with the key's physical value
+        also when the key is in ``raw_code_paths``. Source order and
+        duplicates are kept.
 
     """
 
@@ -361,7 +363,6 @@ class BufrFile:
         raw_code_paths : list of str, optional
             Numeric fields to emit as stored integers, with BUFR missing values
             as nulls. Each must also be kept by ``projection`` when one is given.
-            Cannot be combined with ``list_filters``.
         data_category_filter : list of int, optional
             Data categories to decode; other messages are skipped.
         list_filters : list of ListValueFilter, optional
@@ -532,7 +533,6 @@ def read_bufr(
     raw_code_paths : list of str, optional
         Numeric fields to emit as stored integers, with BUFR missing values as
         nulls. Each must also be kept by ``projection`` when one is given.
-        Cannot be combined with ``list_filters``.
     data_category_filter : list of int, optional
         Data categories to decode, which also orders the categories within a
         table epoch. If None, all categories are read.

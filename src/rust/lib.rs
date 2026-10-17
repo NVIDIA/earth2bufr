@@ -30,7 +30,8 @@ use arrow::array::{
 };
 use arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
-    BinaryType, ByteArrayType, DataType, Field, FieldRef, Fields, Float64Type, Schema, Utf8Type,
+    BinaryType, ByteArrayType, DataType, Field, FieldRef, Fields, Float64Type, Int32Type, Schema,
+    Utf8Type,
 };
 use arrow::util::bit_mask::set_bits;
 use arrow_select::concat::concat;
@@ -4118,9 +4119,20 @@ fn parse_list_value_filters(
         .collect()
 }
 
+/// How the stored values of a filter key give the physical values a filter
+/// compares: as decoded, or as raw codes with this packing.
+#[derive(Clone, Copy)]
+enum KeyValues {
+    Physical,
+    RawCode { reference: i64, divisor: f64 },
+}
+
 /// Index of the filter key among the struct children of a `List<Struct>`
-/// field; the key must be a Float64 child.
-fn list_filter_key_index(field: &Field, filter: &ListValueFilterSpec) -> Result<usize, String> {
+/// field; the key must be a Float64 child or a raw-code Int32 child.
+fn list_filter_key_index(
+    field: &Field,
+    filter: &ListValueFilterSpec,
+) -> Result<(usize, KeyValues), String> {
     let DataType::List(item) = field.data_type() else {
         return Err(format!("Filter path '{}' is not a List array", filter.path));
     };
@@ -4134,13 +4146,24 @@ fn list_filter_key_index(field: &Field, filter: &ListValueFilterSpec) -> Result<
         .iter()
         .position(|child| *child.name() == filter.key)
         .ok_or_else(|| format!("Filter key '{}.{}' was not found", filter.path, filter.key))?;
-    if children[key].data_type() != &DataType::Float64 {
-        return Err(format!(
-            "Filter key '{}.{}' is not numeric Float64",
-            filter.path, filter.key
-        ));
+    let not_numeric = || format!("Filter key '{}.{}' is not numeric", filter.path, filter.key);
+    match children[key].data_type() {
+        DataType::Float64 => Ok((key, KeyValues::Physical)),
+        DataType::Int32 => {
+            let metadata = children[key].metadata();
+            let packing = |name: &str| metadata.get(name).ok_or_else(not_numeric);
+            let reference = packing("reference")?.parse().map_err(|_| not_numeric())?;
+            let scale: i32 = packing("scale")?.parse().map_err(|_| not_numeric())?;
+            Ok((
+                key,
+                KeyValues::RawCode {
+                    reference,
+                    divisor: 10f64.powi(scale),
+                },
+            ))
+        }
+        _ => Err(not_numeric()),
     }
-    Ok(key)
 }
 
 /// Filter entries of one `List<Struct>` while preserving outer row identity.
@@ -4149,13 +4172,18 @@ fn filter_list_struct_values(
     array: &ArrayRef,
     filter: &ListValueFilterSpec,
 ) -> Result<ArrayRef, String> {
-    let key_index = list_filter_key_index(field, filter)?;
+    let (key_index, key_values) = list_filter_key_index(field, filter)?;
     let list = array.as_list::<i32>();
-    let keys = list
-        .values()
-        .as_struct()
-        .column(key_index)
-        .as_primitive::<Float64Type>();
+    let keys = list.values().as_struct().column(key_index);
+    let physical = |index: usize| -> f64 {
+        match key_values {
+            KeyValues::Physical => keys.as_primitive::<Float64Type>().value(index),
+            KeyValues::RawCode { reference, divisor } => {
+                let code = keys.as_primitive::<Int32Type>().value(index);
+                (reference + i64::from(code)) as f64 / divisor
+            }
+        }
+    };
 
     let mut selected = Vec::new();
     let mut offsets = Vec::with_capacity(list.len() + 1);
@@ -4168,7 +4196,7 @@ fn filter_list_struct_values(
                 if keys.is_valid(index)
                     && filter
                         .values
-                        .contains(&numeric_filter_bits(keys.value(index)))
+                        .contains(&numeric_filter_bits(physical(index)))
                 {
                     selected.push(index as u64);
                 }
@@ -4393,9 +4421,6 @@ impl ParsedDecodeOptions {
         let list_value_filters = list_value_filters
             .map(parse_list_value_filters)
             .transpose()?;
-        if raw_code_paths.is_some() && list_value_filters.is_some() {
-            return Err("raw_code_paths cannot be combined with list filters".into());
-        }
         if fixed_replication == FixedReplicationLayout::Structural && list_value_filters.is_some() {
             return Err(
                 "list filters are not supported with fixed_replication='structural'".into(),
@@ -5537,7 +5562,7 @@ fn compressed_messages_to_columns(
             .iter()
             .position(|field| *field.name() == filter.path)
             .ok_or_else(|| format!("List filter path '{}' was not decoded", filter.path))?;
-        let key = list_filter_key_index(&fields[index], filter)?;
+        let (key, _) = list_filter_key_index(&fields[index], filter)?;
         if let ColumnKind::List { filter: kept, .. } = &mut nodes[index].kind {
             *kept = Some(KeyFilter {
                 key,

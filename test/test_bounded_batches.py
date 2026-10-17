@@ -854,7 +854,7 @@ def test_uncompressed_raw_code_path_preserves_missing_as_arrow_null(tmp_path: Pa
 
 @pytest.mark.rust
 def test_invalid_raw_code_requests_raise(tmp_path: Path):
-    """Raw-code paths must be kept by projection and cannot be combined with list filters."""
+    """Raw-code paths must be kept by projection."""
     import earth2bufr
 
     path = surface_observation_case().write(tmp_path)
@@ -866,13 +866,28 @@ def test_invalid_raw_code_requests_raise(tmp_path: Path):
             )
         )
 
-    nested = delayed_replication_case().write(tmp_path)
-    raw_code_paths = ["B031001.B012101"]
-    list_filters = [earth2bufr.ListValueFilter("B031001", "B010004", (85_000.0,))]
-    with earth2bufr.open_bufr(nested) as source, pytest.raises(ValueError):
-        source.iter_batches(raw_code_paths=raw_code_paths, list_filters=list_filters)
-    with pytest.raises(ValueError):
-        earth2bufr.read_bufr(nested, raw_code_paths=raw_code_paths, list_filters=list_filters)
+
+@pytest.mark.rust
+@pytest.mark.parametrize("compressed", [False, True])
+def test_list_filter_on_raw_code_key_matches_physical_values(tmp_path: Path, compressed: bool):
+    """A raw-code filter key is matched by its physical value; kept entries keep their codes."""
+    import earth2bufr
+
+    path = _write_messages(
+        tmp_path, "levels.bufr", [build_template_message(LEVELS, _levels_subsets(4, 3), compressed=compressed)]
+    )
+    keep = [earth2bufr.ListValueFilter("B031001", "B010004", (50_000.0, 51_020.0))]
+    raw = ["B031001.B010004", "B031001.B012101"]
+    with earth2bufr.open_bufr(path) as source:
+        batch = next(source.iter_batches(list_filters=keep, raw_code_paths=raw))
+    assert earth2bufr.read_bufr(path, list_filters=keep, raw_code_paths=raw)[0].column("B031001").equals(
+        _column(batch, "B031001")
+    )
+    assert _column(batch, "B031001").to_pylist() == [
+        [{"B010004": 5_000, "B012101": 25_400}],
+        [],
+        [{"B010004": 5_102, "B012101": None}],
+    ]
 
 
 @pytest.mark.rust
