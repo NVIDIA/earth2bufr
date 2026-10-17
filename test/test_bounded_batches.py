@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -609,6 +610,83 @@ def test_changing_num_threads_keeps_the_output(tmp_path: Path):
     report = json.loads(result.stdout)
     assert report["counts"] == [3, 1, 2]
     assert all(report["equal"])
+
+
+_FORK_AFTER_DECODE = """
+import os, signal, sys
+import pyarrow as pa
+import earth2bufr
+earth2bufr.set_num_threads(2)
+options = dict(messages_per_batch=1, prefetch_batches=2)
+with earth2bufr.open_bufr(sys.argv[1]) as source:
+    reference = pa.Table.from_batches(list(source.iter_batches(**options)))
+    pid = os.fork()
+    if pid == 0:
+        signal.alarm(20)
+        equal = pa.Table.from_batches(list(source.iter_batches(**options))).equals(reference)
+        os._exit(0 if equal else 1)
+    _, status = os.waitpid(pid, 0)
+print(status)
+"""
+
+_FORK_DURING_ITERATION = """
+import json, os, signal, sys
+import pyarrow as pa
+import earth2bufr
+earth2bufr.set_num_threads(2)
+options = dict(messages_per_batch=1, prefetch_batches=2)
+with earth2bufr.open_bufr(sys.argv[1]) as source:
+    reference = pa.Table.from_batches(list(source.iter_batches(**options)))
+    started = source.iter_batches(**options)
+    first = next(started)
+    pid = os.fork()
+    if pid == 0:
+        signal.alarm(20)
+        try:
+            next(started)
+            refused = False
+        except RuntimeError:
+            refused = True
+        del started
+        os._exit(0 if refused else 1)
+    _, status = os.waitpid(pid, 0)
+    parent_equal = pa.Table.from_batches([first, *started]).equals(reference)
+print(json.dumps(dict(status=status, parent_equal=parent_equal)))
+"""
+
+
+def _run_fork_script(tmp_path: Path, script: str) -> str:
+    import subprocess
+    import sys
+
+    message = build_flat_wmo_message(surface_observation_case())
+    path = _write_messages(tmp_path, "fork.bufr", [message] * 8)
+    result = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", script, str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    return result.stdout
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_forked_child_decodes_after_the_parent_used_the_pool(tmp_path: Path):
+    """A child forked after a multi-thread decode decodes the same batches; a hang ends the child with SIGALRM."""
+    assert int(_run_fork_script(tmp_path, _FORK_AFTER_DECODE)) == 0
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_forked_child_refuses_an_iterator_the_parent_started(tmp_path: Path):
+    """An iterator started before fork raises RuntimeError in the child and drops there; the parent finishes it."""
+    import json
+
+    report = json.loads(_run_fork_script(tmp_path, _FORK_DURING_ITERATION))
+    assert report["status"] == 0
+    assert report["parent_equal"]
 
 
 def _compressed_year_humidity_message(years: list[int], humidity: float | None) -> bytes:

@@ -6616,9 +6616,23 @@ fn schema_item_payload(item: &SchemaItem) -> Value {
     }
 }
 
-/// The rayon pool decodes run on. Built on first use and replaced by
-/// `set_num_threads`; a decode keeps the pool it started on.
-static DECODE_POOL: RwLock<Option<Arc<rayon::ThreadPool>>> = RwLock::new(None);
+/// The rayon pool decodes run on and the process that built it. Built on first
+/// use and replaced by `set_num_threads`; a decode keeps the pool it started on.
+struct DecodePool {
+    pool: Arc<rayon::ThreadPool>,
+    pid: u32,
+}
+
+static DECODE_POOL: RwLock<Option<DecodePool>> = RwLock::new(None);
+
+/// A forked child inherits the pool without its worker threads, so work sent to
+/// it never runs. The inherited pool is leaked rather than dropped: dropping it
+/// would signal threads that do not exist in this process.
+fn forget_inherited(pool: DecodePool) -> usize {
+    let threads = pool.pool.current_num_threads();
+    std::mem::forget(pool);
+    threads
+}
 
 /// Thread count from `EARTH2BUFR_NUM_THREADS`, else `RAYON_NUM_THREADS`, else the
 /// available parallelism. Unset, unparsable and zero values are skipped.
@@ -6648,21 +6662,31 @@ fn build_decode_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, String> {
         })
 }
 
-/// The current decode pool, built with `default_num_threads` on first use.
+/// The current decode pool, built with `default_num_threads` on first use. In a
+/// forked child, a pool built by the parent is replaced by one with the same
+/// thread count.
 fn decode_pool() -> Result<Arc<rayon::ThreadPool>, String> {
-    if let Some(pool) = DECODE_POOL
+    let pid = std::process::id();
+    if let Some(current) = DECODE_POOL
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
+        .filter(|current| current.pid == pid)
     {
-        return Ok(Arc::clone(pool));
+        return Ok(Arc::clone(&current.pool));
     }
     let mut slot = DECODE_POOL.write().unwrap_or_else(PoisonError::into_inner);
-    if let Some(pool) = slot.as_ref() {
-        return Ok(Arc::clone(pool));
+    if let Some(current) = slot.as_ref().filter(|current| current.pid == pid) {
+        return Ok(Arc::clone(&current.pool));
     }
-    let pool = build_decode_pool(default_num_threads())?;
-    *slot = Some(Arc::clone(&pool));
+    let threads = slot
+        .take()
+        .map_or_else(default_num_threads, forget_inherited);
+    let pool = build_decode_pool(threads)?;
+    *slot = Some(DecodePool {
+        pool: Arc::clone(&pool),
+        pid,
+    });
     Ok(pool)
 }
 
@@ -6890,9 +6914,12 @@ fn run_prefetch(mut planner: BatchPlanner, channel: &PrefetchChannel, prefetch_b
 }
 
 /// The prefetch thread of one iterator; dropping it stops and joins the thread.
+/// `pid` is the process that started the thread: a forked child has a copy of
+/// this handle but not the thread.
 struct Prefetch {
     channel: Arc<PrefetchChannel>,
     thread: Option<JoinHandle<()>>,
+    pid: u32,
 }
 
 impl Prefetch {
@@ -6908,7 +6935,12 @@ impl Prefetch {
         Ok(Self {
             channel,
             thread: Some(thread),
+            pid: std::process::id(),
         })
+    }
+
+    fn in_this_process(&self) -> bool {
+        self.pid == std::process::id()
     }
 
     /// The next decoded group in source order, or `None` once the producer is done.
@@ -6936,6 +6968,11 @@ impl Prefetch {
 
 impl Drop for Prefetch {
     fn drop(&mut self) {
+        if !self.in_this_process() {
+            // The thread and any lock it held exist only in the parent.
+            std::mem::forget(self.thread.take());
+            return;
+        }
         if self.thread.is_some() {
             // The producer finishes its current decode before it sees the stop.
             Python::with_gil(|py| {
@@ -7195,6 +7232,12 @@ impl BufrBatchIterator {
             let Some(prefetch) = self.prefetch.as_ref() else {
                 return Ok(None);
             };
+            if !prefetch.in_this_process() {
+                return Err(PyRuntimeError::new_err(
+                    "This BUFR batch iterator was started in a parent process; \
+                     iterate a new iter_batches() in the forked child",
+                ));
+            }
             match py.allow_threads(|| prefetch.next_group()) {
                 Some(Ok((batches, failures))) => {
                     self.ready_batches.extend(batches);
@@ -7880,7 +7923,14 @@ fn set_num_threads_rust(threads: usize) -> PyResult<()> {
         ));
     }
     let pool = build_decode_pool(threads).map_err(PyRuntimeError::new_err)?;
-    *DECODE_POOL.write().unwrap_or_else(PoisonError::into_inner) = Some(pool);
+    let pid = std::process::id();
+    let previous = DECODE_POOL
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(DecodePool { pool, pid });
+    if let Some(inherited) = previous.filter(|previous| previous.pid != pid) {
+        forget_inherited(inherited);
+    }
     Ok(())
 }
 
