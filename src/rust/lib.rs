@@ -5420,6 +5420,13 @@ fn decode_compressed_into_slots(
                         ),
                         None => kept,
                     };
+                    // An entry no subset keeps writes nothing and is stepped over.
+                    if element_kept.is_some_and(|flags| !flags.contains(&true)) {
+                        for item in group.iter() {
+                            skip_compressed_item(reader, item, n)?;
+                        }
+                        continue;
+                    }
                     decode_compressed_into_slots(reader, group, children, n, element_kept)?;
                 }
                 let mut placement = entries.place(kept)?;
