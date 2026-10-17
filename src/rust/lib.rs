@@ -26,7 +26,7 @@ use arrow::array::{
     downcast_primitive_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
     AsArray, BooleanArray, FixedSizeListArray, Float64Array, Float64Builder, GenericByteArray,
     Int32Array, Int32Builder, ListArray, ListBuilder, RecordBatch, RecordBatchOptions, StringArray,
-    StringBuilder, StructArray, StructBuilder, UInt32Array, UInt64Array,
+    StringBuilder, StructArray, StructBuilder, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
@@ -7038,15 +7038,16 @@ impl BufrBatchIterator {
 
 #[pymethods]
 impl BufrFileHandle {
-    /// Describe every message and DX table epoch from the cached index.
-    fn file_info_json(&self) -> PyResult<String> {
+    /// Message headers as Arrow and DX table epochs as JSON, from the cached index.
+    fn file_info(&self) -> PyResult<(PyRecordBatch, String)> {
         let state = &self.state;
-        file_info_json(
+        file_info(
             &state.headers,
             &state.spans,
             &state.message_epoch,
             &state.epochs,
         )
+        .map(|(batch, epochs)| (PyRecordBatch::new(batch), epochs))
         .map_err(PyValueError::new_err)
     }
 
@@ -7386,98 +7387,100 @@ fn message_epochs(message_count: usize, epochs: &[TableEpoch]) -> Vec<usize> {
     message_epoch
 }
 
-/// One `MessageInfo` as serialized to Python.
-#[derive(Serialize)]
-struct MessageInfoRecord {
-    source_message_index: usize,
-    offset: usize,
-    size_bytes: usize,
-    edition: u8,
-    master_table: u8,
-    center: u16,
-    sub_center: u16,
-    update_sequence: u8,
-    optional_section_present: bool,
-    data_category: u8,
-    international_sub_category: u8,
-    local_sub_category: u8,
-    master_table_version: u8,
-    local_table_version: u8,
-    year: u16,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
-    subsets: u16,
-    compressed: bool,
-    section3_flags: u8,
-    #[serde(serialize_with = "serialize_descriptors")]
-    descriptors: Vec<u32>,
-    table_epoch: Option<usize>,
-}
-
-fn serialize_descriptors<S: serde::Serializer>(
-    descriptors: &[u32],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serializer.collect_seq(descriptors.iter().map(|value| descriptor_to_string(*value)))
-}
-
-#[derive(Serialize)]
-struct FileInfoRecord {
-    messages: Vec<MessageInfoRecord>,
-    table_epochs: Vec<Value>,
-}
-
-/// Describe every message and DX table epoch as JSON.
+/// Message headers, one Arrow row per message with the columns of
+/// `MessageInfo`, and the table epochs as JSON.
 ///
 /// `messages[i]` holds at least Sections 0-3 and the Section 4 header of the
 /// message at `spans[i]` in the file, and DX messages whole.
-fn file_info_json(
+fn file_info(
     messages: &[BufrMessage],
     spans: &[std::ops::Range<usize>],
     message_epoch: &[usize],
     epochs: &[TableEpoch],
-) -> Result<String, String> {
-    let mut infos = Vec::with_capacity(messages.len());
-    for (index, (message, span)) in messages.iter().zip(spans).enumerate() {
-        let parsed = parse_message_header(message, span.len())
-            .map_err(|error| format!("Failed to read BUFR message {index}: {error}"))?;
-        let epoch = message_epoch[index];
-        infos.push(MessageInfoRecord {
-            source_message_index: index,
-            offset: span.start,
-            size_bytes: span.len(),
-            edition: parsed.edition,
-            master_table: parsed.master_table,
-            center: parsed.center,
-            sub_center: parsed.sub_center,
-            update_sequence: parsed.update_sequence,
-            optional_section_present: parsed.optional_section_present,
-            data_category: parsed.data_category,
-            international_sub_category: parsed.intl_sub_category,
-            local_sub_category: parsed.local_sub_category,
-            master_table_version: parsed.master_table_version,
-            local_table_version: parsed.local_table_version,
-            year: parsed.year,
-            month: parsed.month,
-            day: parsed.day,
-            hour: parsed.hour,
-            minute: parsed.minute,
-            second: parsed.second,
-            subsets: parsed.num_subsets,
-            compressed: parsed.is_compressed,
-            section3_flags: parsed.section3_flags,
-            descriptors: parsed.descriptors,
-            table_epoch: (epoch != usize::MAX).then_some(epoch),
-        });
+) -> Result<(RecordBatch, String), String> {
+    let headers = messages
+        .iter()
+        .zip(spans)
+        .enumerate()
+        .map(|(index, (message, span))| {
+            parse_message_header(message, span.len())
+                .map_err(|error| format!("Failed to read BUFR message {index}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut descriptors = ListBuilder::new(StringBuilder::new());
+    for header in &headers {
+        for descriptor in &header.descriptors {
+            descriptors
+                .values()
+                .append_value(descriptor_to_string(*descriptor));
+        }
+        descriptors.append(true);
     }
-    let record = FileInfoRecord {
-        messages: infos,
-        table_epochs: table_epoch_report(messages, epochs)?,
+    let u8s = |value: fn(&ParsedMessage<'_>) -> u8| -> ArrayRef {
+        Arc::new(UInt8Array::from_iter_values(headers.iter().map(value)))
     };
-    serde_json::to_string(&record).map_err(|error| error.to_string())
+    let u16s = |value: fn(&ParsedMessage<'_>) -> u16| -> ArrayRef {
+        Arc::new(UInt16Array::from_iter_values(headers.iter().map(value)))
+    };
+    let bools = |value: fn(&ParsedMessage<'_>) -> bool| -> ArrayRef {
+        Arc::new(BooleanArray::from_iter(
+            headers.iter().map(|header| Some(value(header))),
+        ))
+    };
+    let u64s = |values: Vec<u64>| -> ArrayRef { Arc::new(UInt64Array::from(values)) };
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        ("source_message_index", u64s((0..headers.len() as u64).collect())),
+        ("offset", u64s(spans.iter().map(|span| span.start as u64).collect())),
+        ("size_bytes", u64s(spans.iter().map(|span| span.len() as u64).collect())),
+        ("edition", u8s(|header| header.edition)),
+        ("master_table", u8s(|header| header.master_table)),
+        ("center", u16s(|header| header.center)),
+        ("sub_center", u16s(|header| header.sub_center)),
+        ("update_sequence", u8s(|header| header.update_sequence)),
+        (
+            "optional_section_present",
+            bools(|header| header.optional_section_present),
+        ),
+        ("data_category", u8s(|header| header.data_category)),
+        (
+            "international_sub_category",
+            u8s(|header| header.intl_sub_category),
+        ),
+        ("local_sub_category", u8s(|header| header.local_sub_category)),
+        (
+            "master_table_version",
+            u8s(|header| header.master_table_version),
+        ),
+        ("local_table_version", u8s(|header| header.local_table_version)),
+        ("year", u16s(|header| header.year)),
+        ("month", u8s(|header| header.month)),
+        ("day", u8s(|header| header.day)),
+        ("hour", u8s(|header| header.hour)),
+        ("minute", u8s(|header| header.minute)),
+        ("second", u8s(|header| header.second)),
+        ("subsets", u16s(|header| header.num_subsets)),
+        ("compressed", bools(|header| header.is_compressed)),
+        ("section3_flags", u8s(|header| header.section3_flags)),
+        ("descriptors", Arc::new(descriptors.finish())),
+        (
+            "table_epoch",
+            Arc::new(UInt64Array::from_iter(message_epoch.iter().map(|epoch| {
+                (*epoch != usize::MAX).then_some(*epoch as u64)
+            }))),
+        ),
+    ];
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|(name, array)| Field::new(*name, array.data_type().clone(), *name == "table_epoch"))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns.into_iter().map(|(_, array)| array).collect(),
+    )
+    .map_err(|error| format!("Message header table error: {error}"))?;
+    let table_epochs = serde_json::to_string(&table_epoch_report(messages, epochs)?)
+        .map_err(|error| error.to_string())?;
+    Ok((batch, table_epochs))
 }
 
 /// Parse a message read up to at least its Section 4 header, out of
@@ -7533,10 +7536,10 @@ fn read_message_headers(
 /// Describe a BUFR file's messages and table epochs from their headers.
 ///
 /// Reads Sections 0-3 of each message and DX table messages whole. The JSON
-/// equals `BufrFileHandle.file_info_json` for the same file. Table epochs
+/// equals `BufrFileHandle.file_info` for the same file. Table epochs
 /// depend only on DX blocks, so base tables are not loaded.
 #[pyfunction]
-fn file_info_rust(file_path: &str) -> PyResult<String> {
+fn file_info_rust(file_path: &str) -> PyResult<(PyRecordBatch, String)> {
     let (messages, spans) = FileSource::open(file_path)
         .and_then(|mut source| read_message_headers(&mut source))
         .map_err(|error| PyValueError::new_err(format!("Failed to read file: {error}")))?;
@@ -7547,7 +7550,9 @@ fn file_info_rust(file_path: &str) -> PyResult<String> {
         PyValueError::new_err(format!("Failed to extract DX table epochs: {error}"))
     })?;
     let message_epoch = message_epochs(messages.len(), &epochs);
-    file_info_json(&messages, &spans, &message_epoch, &epochs).map_err(PyValueError::new_err)
+    file_info(&messages, &spans, &message_epoch, &epochs)
+        .map(|(batch, epochs)| (PyRecordBatch::new(batch), epochs))
+        .map_err(PyValueError::new_err)
 }
 
 /// Report each table epoch's embedded DX hash and the descriptors its DX block

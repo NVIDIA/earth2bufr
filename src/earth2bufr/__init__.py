@@ -36,7 +36,7 @@ Example:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -228,21 +228,36 @@ class TableEpoch:
     redefines: tuple[TableRedefinition, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class FileInfo:
     """Message headers and table epochs of a BUFR file, read without decoding data.
 
-    ``messages`` covers every message in file order, including DX table
-    messages and messages without subsets.
+    ``message_table`` holds one row per message in file order, including DX
+    table messages and messages without subsets, with the fields of
+    :class:`MessageInfo` as columns. ``messages`` and ``data_messages`` build
+    ``MessageInfo`` objects from it on first access.
     """
 
-    messages: tuple[MessageInfo, ...]
+    message_table: pa.RecordBatch
     table_epochs: tuple[TableEpoch, ...]
 
-    @property
+    @cached_property
+    def messages(self) -> tuple[MessageInfo, ...]:
+        """Every message in file order, including DX table messages and messages without subsets."""
+        columns = {name: self.message_table.column(name).to_pylist() for name in _MESSAGE_FIELDS}
+        columns["descriptors"] = [tuple(descriptors) for descriptors in columns["descriptors"]]
+        return tuple(MessageInfo(*row) for row in zip(*columns.values(), strict=True))
+
+    @cached_property
     def data_messages(self) -> tuple[MessageInfo, ...]:
         """Messages that carry subsets, excluding DX table messages."""
         return tuple(message for message in self.messages if message.table_epoch is not None)
+
+    def __eq__(self, other: object) -> bool:
+        """Equal when both describe the same messages and table epochs."""
+        if not isinstance(other, FileInfo):
+            return NotImplemented
+        return self.message_table.equals(other.message_table) and self.table_epochs == other.table_epochs
 
 
 @dataclass(frozen=True)
@@ -256,21 +271,21 @@ class DecodeFailure:
     reason: str
 
 
-def _message_info(message: dict[str, Any]) -> MessageInfo:
-    fields: dict[str, Any] = {**message, "descriptors": tuple(message["descriptors"])}
-    return MessageInfo(**fields)
+_MESSAGE_FIELDS = tuple(field.name for field in fields(MessageInfo))
 
 
-def _file_info(payload: dict[str, Any]) -> FileInfo:
-    messages = tuple(_message_info(message) for message in payload["messages"])
+def _file_info(native: tuple[Any, str]) -> FileInfo:
+    import pyarrow as pa
+
+    message_table, table_epochs_json = native
     table_epochs = tuple(
         TableEpoch(
             embedded_table_sha256=epoch["embedded_table_sha256"],
             redefines=tuple(TableRedefinition(**item) for item in epoch["redefines"]),
         )
-        for epoch in payload["table_epochs"]
+        for epoch in json.loads(table_epochs_json)
     )
-    return FileInfo(messages, table_epochs)
+    return FileInfo(pa.record_batch(message_table), table_epochs)
 
 
 def _native_list_filters(list_filters: list[ListValueFilter] | None) -> list[tuple[str, str, list[float]]] | None:
@@ -425,7 +440,7 @@ class BufrFile:
     @cached_property
     def info(self) -> FileInfo:
         """Message headers and table epochs of the file."""
-        return _file_info(json.loads(self._native().file_info_json()))
+        return _file_info(self._native().file_info())
 
     def source_structure(self, source_message_index: int) -> dict[str, Any]:
         """Describe the template, tables and effective packing that decode one message.
@@ -681,7 +696,7 @@ def get_metadata(file_path: str | Path) -> FileInfo:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"BUFR file not found: {path}")
-    return _file_info(json.loads(_get_lib().file_info_rust(str(path))))
+    return _file_info(_get_lib().file_info_rust(str(path)))
 
 
 def set_num_threads(threads: int) -> None:

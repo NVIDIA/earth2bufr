@@ -390,6 +390,7 @@ BUFR message or a header cannot be read.
 ```python
 info = earth2bufr.get_metadata("observations.bufr")
 
+info.message_table      # the same headers as an Arrow RecordBatch, one row per message
 info.messages           # MessageInfo for every message, including DX table and empty messages
 info.data_messages      # messages that carry subsets
 info.table_epochs       # TableEpoch per table set
@@ -398,6 +399,16 @@ for message in info.data_messages:
     print(message.data_category, message.local_sub_category, message.center)
     print(message.subsets, message.compressed, message.descriptors[:3])
     print(message.year, message.month, message.day, message.hour, message.minute)
+```
+
+`message_table` has the fields of `MessageInfo` as columns. `messages` and
+`data_messages` build one `MessageInfo` per message on first access; files
+with many messages read columns from the table instead:
+
+```python
+table = info.message_table
+subcategory = table.column("local_sub_category").to_numpy()  # by source_message_index
+data_rows = table.filter(table.column("table_epoch").is_valid())
 ```
 
 ## Flattening Nested Output

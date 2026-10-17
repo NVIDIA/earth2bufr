@@ -1280,6 +1280,25 @@ def test_get_metadata_equals_open_file_info(tmp_path: Path, raw: bytes):
 
 
 @pytest.mark.rust
+def test_message_table_columns_match_message_info(tmp_path: Path):
+    """FileInfo.message_table has one row per message with the MessageInfo fields as columns."""
+    import dataclasses
+
+    import earth2bufr
+
+    path = tmp_path / "messages.bufr"
+    path.write_bytes(build_two_epoch_prepbufr_messages())
+    info = earth2bufr.get_metadata(path)
+    names = [field.name for field in dataclasses.fields(earth2bufr.MessageInfo)]
+    assert info.message_table.schema.names == names
+    for name in names:
+        expected = [getattr(message, name) for message in info.messages]
+        column = info.message_table.column(name).to_pylist()
+        assert [tuple(value) if name == "descriptors" else value for value in column] == expected, name
+    assert None in info.message_table.column("table_epoch").to_pylist()
+
+
+@pytest.mark.rust
 def test_source_structure_selects_one_message_from_mixed_templates(tmp_path: Path):
     """Indexed lookup resolves one template while unindexed lookup stays strict."""
     import earth2bufr
