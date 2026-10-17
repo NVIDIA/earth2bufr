@@ -7556,9 +7556,18 @@ fn file_info(
     };
     let u64s = |values: Vec<u64>| -> ArrayRef { Arc::new(UInt64Array::from(values)) };
     let columns: Vec<(&str, ArrayRef)> = vec![
-        ("source_message_index", u64s((0..headers.len() as u64).collect())),
-        ("offset", u64s(spans.iter().map(|span| span.start as u64).collect())),
-        ("size_bytes", u64s(spans.iter().map(|span| span.len() as u64).collect())),
+        (
+            "source_message_index",
+            u64s((0..headers.len() as u64).collect()),
+        ),
+        (
+            "offset",
+            u64s(spans.iter().map(|span| span.start as u64).collect()),
+        ),
+        (
+            "size_bytes",
+            u64s(spans.iter().map(|span| span.len() as u64).collect()),
+        ),
         ("edition", u8s(|header| header.edition)),
         ("master_table", u8s(|header| header.master_table)),
         ("center", u16s(|header| header.center)),
@@ -7573,12 +7582,18 @@ fn file_info(
             "international_sub_category",
             u8s(|header| header.intl_sub_category),
         ),
-        ("local_sub_category", u8s(|header| header.local_sub_category)),
+        (
+            "local_sub_category",
+            u8s(|header| header.local_sub_category),
+        ),
         (
             "master_table_version",
             u8s(|header| header.master_table_version),
         ),
-        ("local_table_version", u8s(|header| header.local_table_version)),
+        (
+            "local_table_version",
+            u8s(|header| header.local_table_version),
+        ),
         ("year", u16s(|header| header.year)),
         ("month", u8s(|header| header.month)),
         ("day", u8s(|header| header.day)),
@@ -7591,9 +7606,11 @@ fn file_info(
         ("descriptors", Arc::new(descriptors.finish())),
         (
             "table_epoch",
-            Arc::new(UInt64Array::from_iter(message_epoch.iter().map(|epoch| {
-                (*epoch != usize::MAX).then_some(*epoch as u64)
-            }))),
+            Arc::new(UInt64Array::from_iter(
+                message_epoch
+                    .iter()
+                    .map(|epoch| (*epoch != usize::MAX).then_some(*epoch as u64)),
+            )),
         ),
     ];
     let fields: Vec<Field> = columns
