@@ -329,7 +329,16 @@ struct OperatorState {
     associated_field_stack: Vec<u32>,
     /// Increase scale/width from operator 207 (Y value, 0 means inactive)
     increase_scale_width_y: u32,
+    /// Replication groups being expanded around the current descriptor.
+    replication_depth: usize,
+    /// Table D sequences inlined so far in this template.
+    sequence_expansions: usize,
 }
+
+/// Bounds on template expansion. A Table D sequence that contains itself, which
+/// a file's own DX table can define, would otherwise expand without end.
+const MAX_REPLICATION_DEPTH: usize = 64;
+const MAX_SEQUENCE_EXPANSIONS: usize = 100_000;
 
 // =============================================================================
 // BUFR Reading Functions
@@ -1093,6 +1102,28 @@ fn expand_descriptors(
     )
 }
 
+fn expand_replicated_group(
+    replication: u32,
+    group: &[u32],
+    tables: &TableSet,
+    state: &mut OperatorState,
+    strict: bool,
+    structural_fixed_replication: bool,
+) -> Result<Vec<ExpandedItem>, String> {
+    if state.replication_depth >= MAX_REPLICATION_DEPTH {
+        return Err(format!(
+            "Replication {} is nested more than {MAX_REPLICATION_DEPTH} levels deep; \
+             a Table D sequence may contain itself",
+            descriptor_to_string(replication)
+        ));
+    }
+    state.replication_depth += 1;
+    let expanded =
+        expand_descriptors_inner(group, tables, state, strict, structural_fixed_replication);
+    state.replication_depth -= 1;
+    expanded
+}
+
 fn expand_descriptors_inner(
     descriptors: &[u32],
     tables: &TableSet,
@@ -1100,6 +1131,8 @@ fn expand_descriptors_inner(
     strict: bool,
     structural_fixed_replication: bool,
 ) -> Result<Vec<ExpandedItem>, String> {
+    let mut inlined: Vec<u32>;
+    let mut descriptors = descriptors;
     let mut result = Vec::new();
     let mut i = 0;
 
@@ -1205,7 +1238,8 @@ fn expand_descriptors_inner(
                         })?;
 
                     let group_descs = &descriptors[i + 2..i + 2 + num_following];
-                    let expanded_group = expand_descriptors_inner(
+                    let expanded_group = expand_replicated_group(
+                        desc,
                         group_descs,
                         tables,
                         state,
@@ -1229,7 +1263,8 @@ fn expand_descriptors_inner(
                         ));
                     }
                     let group = &descriptors[i + 1..i + 1 + num_following];
-                    let expanded_group = expand_descriptors_inner(
+                    let expanded_group = expand_replicated_group(
+                        desc,
                         group,
                         tables,
                         state,
@@ -1351,23 +1386,23 @@ fn expand_descriptors_inner(
             3 => {
                 // Table D sequence - expand inline
                 if let Some(entry) = tables.table_d.get(&desc) {
+                    state.sequence_expansions += 1;
+                    if state.sequence_expansions > MAX_SEQUENCE_EXPANSIONS {
+                        return Err(format!(
+                            "Template expands more than {MAX_SEQUENCE_EXPANSIONS} Table D \
+                             sequences; {} may contain itself",
+                            descriptor_to_string(desc)
+                        ));
+                    }
                     // Inline the sequence's descriptors into the current level
-                    // by building a combined list of the remaining descriptors
+                    // and continue with the combined list.
                     let mut combined =
                         Vec::with_capacity(entry.descriptors.len() + descriptors.len() - i - 1);
                     combined.extend_from_slice(&entry.descriptors);
                     combined.extend_from_slice(&descriptors[i + 1..]);
-
-                    // Recursively expand the combined list
-                    let expanded = expand_descriptors_inner(
-                        &combined,
-                        tables,
-                        state,
-                        strict,
-                        structural_fixed_replication,
-                    )?;
-                    result.extend(expanded);
-                    return Ok(result);
+                    inlined = combined;
+                    descriptors = &inlined;
+                    i = 0;
                 } else {
                     return Err(format!(
                         "Unknown Table D descriptor {}",

@@ -28,6 +28,7 @@ from .builders import (
     LEGACY_MISSING_STRING,
     build_embedded_code_flag_operator_message,
     build_ia5_missing_prepbufr,
+    build_self_referencing_sequence_messages,
     build_two_epoch_prepbufr_messages,
     synthetic_prepbufr_dx_case,
 )
@@ -75,6 +76,47 @@ def test_synthetic_prepbufr_dx_table_decodes_local_sequence(tmp_path: Path):
     assert "TOB" not in overridden
     assert overridden["CUSTOM_TOB"].tolist() == [pytest.approx(273.1)]
     assert overridden["_data_category"].tolist() == [case.data_category]
+
+
+_DECODE_BOTH_MODES = """
+import sys
+import earth2bufr
+earth2bufr.set_num_threads(2)
+for strict in (False, True):
+    try:
+        with earth2bufr.open_bufr(sys.argv[1], strict=strict) as source:
+            list(source.iter_batches())
+    except ValueError as error:
+        print(str(error).replace(chr(10), " "))
+"""
+
+
+@pytest.mark.parametrize(
+    ("members", "named"),
+    [([(0, 63, 1), (3, 63, 1)], "3-63-001"), ([(1, 1, 2), (3, 63, 1)], "1-01-002")],
+    ids=["inline", "replicated"],
+)
+def test_dx_sequence_that_contains_itself_raises(tmp_path: Path, members, named):
+    """A DX sequence that contains itself raises in both modes, naming the descriptor, instead of crashing.
+
+    The decode runs in a subprocess so a crash fails the test instead of ending pytest.
+    """
+    import subprocess
+    import sys
+
+    path = tmp_path / "self_referencing.bufr"
+    path.write_bytes(build_self_referencing_sequence_messages(members))
+
+    result = subprocess.run(
+        [sys.executable, "-c", _DECODE_BOTH_MODES, str(path)], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    permissive, strict = result.stdout.splitlines()
+    assert permissive.startswith("Source BUFR message 1:")
+    assert strict.startswith("Strict BUFR template validation failed:")
+    for error in (permissive, strict):
+        assert "may contain itself" in error
+        assert named in error
 
 
 def _epoch_rows(batches) -> list[dict]:

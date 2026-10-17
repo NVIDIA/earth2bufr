@@ -281,6 +281,12 @@ bitmaps and values they announce decode as ordinary columns. Strict decoding
 rejects them. `2-03-000` (end of reference value changes) and `2-05-000` (zero
 characters) occupy no bits and decode in both modes.
 
+A Table D sequence that contains itself, directly or inside a replicated group,
+is a malformed table: it raises `ValueError` in both modes, naming the sequence
+or replication descriptor (at open time under `strict=True`, otherwise at the
+first message that uses it). Expansion stops after 100,000 inlined sequences or
+64 nested replications.
+
 `skip_truncated_messages` skips messages whose template extends past their
 Section 4 payload and decodes the rest; the iterator's `decode_failures` lists
 what was skipped. Without it, a truncated message raises under `strict=True` and
