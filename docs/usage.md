@@ -28,8 +28,9 @@ batches = earth2bufr.read_bufr(
 ```
 
 `read_bufr` takes the decode options of `iter_batches` -- `projection`,
-`list_filters`, `raw_code_paths`, `data_category_filter`, `fixed_replication`
-and `skip_truncated_messages` -- with the same meaning and validation, and the
+`list_filters`, `raw_code_paths`, `data_category_filter`, `fixed_replication`,
+`skip_truncated_messages` and `projection_missing` -- with the same meaning and
+validation, and the
 `strict` option of `open_bufr`. Its batches carry `_data_category` and no
 provenance columns. The `mnemonics` argument is removed; `projection` replaces
 it and raises on fields a decoded template does not have.
@@ -129,6 +130,24 @@ the subset's position within the message.
 
 Projection in flat mode accepts `FIELD` and `FIELD.CHILD`; structural mode
 accepts deeper paths.
+
+A projected field that a decoded template does not have raises. In files that
+mix templates, such as NCEP satellite-wind dumps, `projection_missing="skip"`
+leaves it out of that template's batches instead, along with the
+`raw_code_paths` and `list_filters` under it; each template's batches keep the
+projected fields it has:
+
+```python
+with earth2bufr.open_bufr("gdas.t00z.satwnd.tm00.bufr_d") as source:
+    for batch in source.iter_batches(
+        projection=["SAID", "CLAT", "CLATH", "CLON", "CLONH", "PRLC", "WDIR", "WSPD"],
+        projection_missing="skip",
+    ):
+        ...
+```
+
+A template with none of the projected fields gives batches with only
+`_data_category`, `_source_message_index` and `_source_subset_index`.
 
 ## Threads
 

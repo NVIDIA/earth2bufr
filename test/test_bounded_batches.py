@@ -1721,6 +1721,57 @@ def _mixed_file(tmp_path: Path) -> Path:
     return _write_messages(tmp_path, "mixed.bufr", messages)
 
 
+@pytest.mark.rust
+@pytest.mark.parametrize("fixed_replication", ["flat", "structural"])
+def test_projection_missing_skip_keeps_the_fields_each_template_has(tmp_path: Path, fixed_replication: str):
+    """projection_missing="skip" leaves out the projected fields a template lacks and keeps the rest."""
+    import earth2bufr
+
+    path = _mixed_file(tmp_path)
+    wind = "B011002" if fixed_replication == "flat" else "fixed_1_01_002__occ_0"
+    projection = ["B004001", "B031001.B010004", wind]
+    options = {"projection": projection, "fixed_replication": fixed_replication}
+    with earth2bufr.open_bufr(path) as source:
+        with pytest.raises(ValueError):
+            list(source.iter_batches(**options))
+        full = list(source.iter_batches(fixed_replication=fixed_replication))
+        skipped = list(source.iter_batches(**options, projection_missing="skip"))
+    assert [batch.num_rows for batch in skipped] == [batch.num_rows for batch in full]
+    for got, whole in zip(skipped, full, strict=True):
+        levels = "B031001" in whole.schema.names
+        assert set(got.schema.names) - set(PROVENANCE_COLUMNS) == {"B004001", "_data_category"} | (
+            {"B031001"} if levels else {wind}
+        )
+        assert _column(got, "B004001").equals(_column(whole, "B004001"))
+        if levels:
+            got_levels, whole_levels = _column(got, "B031001"), _column(whole, "B031001")
+            assert got_levels.type.value_type.names == ["B010004"]
+            assert got_levels.offsets.equals(whole_levels.offsets)
+            assert got_levels.values.field("B010004").equals(whole_levels.values.field("B010004"))
+        else:
+            assert _columns_by_name(got, wind) == _columns_by_name(whole, wind)
+
+
+@pytest.mark.rust
+def test_projection_missing_skip_applies_raw_codes_where_the_field_exists(tmp_path: Path):
+    """Raw-code paths under a skipped field are skipped with it; read_bufr takes the same option."""
+    import earth2bufr
+
+    path = _mixed_file(tmp_path)
+    options = {
+        "projection": ["B004001", "B031001.B010004", "B011002"],
+        "raw_code_paths": ["B031001.B010004", "B011002"],
+        "projection_missing": "skip",
+    }
+    batches = earth2bufr.read_bufr(path, **options)
+    pressures = [batch.column("B031001").type.value_type.field("B010004").type for batch in batches if "B031001" in batch.schema.names]
+    winds = [field.type for batch in batches for field in batch.schema if field.name == "B011002"]
+    assert pressures and set(pressures) == {pa.int32()}
+    assert winds and set(winds) == {pa.int32()}
+    with pytest.raises(ValueError):
+        earth2bufr.read_bufr(path, **{**options, "projection_missing": "null"})
+
+
 def _runs(batches) -> list[pa.Table]:
     """Consecutive batches with one schema, joined."""
     runs: list[list[pa.RecordBatch]] = []

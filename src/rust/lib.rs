@@ -4351,6 +4351,86 @@ struct BoundedDecodeOptions<'a> {
     list_value_filters: Option<&'a [ListValueFilterSpec]>,
     policy: ReadPolicy,
     fixed_replication: FixedReplicationLayout,
+    projection_missing: ProjectionMissing,
+}
+
+/// What a decode does with projected fields a template does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionMissing {
+    Raise,
+    Skip,
+}
+
+impl ProjectionMissing {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "raise" => Ok(Self::Raise),
+            "skip" => Ok(Self::Skip),
+            other => Err(format!(
+                "projection_missing must be 'raise' or 'skip', got '{other}'"
+            )),
+        }
+    }
+}
+
+/// The projection, raw-code paths and list filters of one decode that name
+/// fields its template has.
+struct PresentFields {
+    projection: Option<Projection>,
+    raw_code_paths: Option<Vec<String>>,
+    list_value_filters: Option<Vec<ListValueFilterSpec>>,
+}
+
+impl<'a> BoundedDecodeOptions<'a> {
+    fn present_fields(&self, present: impl Fn(&str) -> bool) -> Result<PresentFields, String> {
+        let projection = self
+            .projection
+            .map(|projection| {
+                let paths: Vec<String> = projection
+                    .paths
+                    .iter()
+                    .filter(|path| present(path))
+                    .cloned()
+                    .collect();
+                let tree = if paths.is_empty() {
+                    ProjectionTree::default()
+                } else {
+                    parse_projection_tree(&paths, self.fixed_replication)?
+                };
+                Ok::<_, String>(Projection { paths, tree })
+            })
+            .transpose()?;
+        let raw_code_paths = self
+            .raw_code_paths
+            .map(|paths| -> Vec<String> {
+                paths.iter().filter(|path| present(path)).cloned().collect()
+            })
+            .filter(|paths| !paths.is_empty());
+        let list_value_filters = self
+            .list_value_filters
+            .map(|filters| -> Vec<ListValueFilterSpec> {
+                filters
+                    .iter()
+                    .filter(|filter| present(&filter.path))
+                    .cloned()
+                    .collect()
+            })
+            .filter(|filters| !filters.is_empty());
+        Ok(PresentFields {
+            projection,
+            raw_code_paths,
+            list_value_filters,
+        })
+    }
+
+    fn with_fields(self, fields: &'a PresentFields) -> Self {
+        Self {
+            projection: fields.projection.as_ref(),
+            raw_code_paths: fields.raw_code_paths.as_deref(),
+            list_value_filters: fields.list_value_filters.as_deref(),
+            ..self
+        }
+    }
 }
 
 /// Decode options shared by `iter_batches` and `read_bufr`, validated and
@@ -4361,6 +4441,7 @@ struct ParsedDecodeOptions {
     list_value_filters: Option<Vec<ListValueFilterSpec>>,
     fixed_replication: FixedReplicationLayout,
     skip_truncated_messages: bool,
+    projection_missing: ProjectionMissing,
 }
 
 impl ParsedDecodeOptions {
@@ -4370,8 +4451,10 @@ impl ParsedDecodeOptions {
         list_value_filters: Option<Vec<(String, String, Vec<f64>)>>,
         fixed_replication: &str,
         skip_truncated_messages: bool,
+        projection_missing: &str,
     ) -> Result<Self, String> {
         let fixed_replication = FixedReplicationLayout::parse(fixed_replication)?;
+        let projection_missing = ProjectionMissing::parse(projection_missing)?;
         let projection = projection
             .map(|paths| Projection::parse(paths, fixed_replication))
             .transpose()?;
@@ -4444,6 +4527,7 @@ impl ParsedDecodeOptions {
             list_value_filters,
             fixed_replication,
             skip_truncated_messages,
+            projection_missing,
         })
     }
 
@@ -4459,6 +4543,7 @@ impl ParsedDecodeOptions {
                 reject_overrun: strict || self.skip_truncated_messages,
             },
             fixed_replication: self.fixed_replication,
+            projection_missing: self.projection_missing,
         }
     }
 }
@@ -6047,6 +6132,15 @@ fn decode_structural_bounded_group(
         FixedReplicationLayout::Structural,
     )?;
     let mut schema = derive_structural_schema(&expanded, None);
+    let present;
+    let options = if options.projection_missing == ProjectionMissing::Skip {
+        present = options.present_fields(|path| {
+            find_structural_item(&schema, &path.split('.').collect::<Vec<_>>()).is_some()
+        })?;
+        options.with_fields(&present)
+    } else {
+        options
+    };
     apply_structural_raw_code_paths(&mut schema, options.raw_code_paths)?;
     if let Some(projection) = options.projection {
         validate_structural_paths(&schema, &projection.paths, "Projection")?;
@@ -6085,9 +6179,31 @@ fn decode_structural_bounded_group(
             list_value_filters: None,
             policy: options.policy,
             fixed_replication: FixedReplicationLayout::Flat,
+            projection_missing: ProjectionMissing::Raise,
         },
     )?;
     restack_flat_batch_structurally(flat, &schema, selection)
+}
+
+fn schema_item_name(item: &SchemaItem) -> &str {
+    match item {
+        SchemaItem::Scalar { name, .. } | SchemaItem::ReplicationGroup { name, .. } => name,
+    }
+}
+
+/// Whether a flat `FIELD` or `FIELD.CHILD` path names a field of `schema`.
+fn flat_path_present(schema: &[SchemaItem], path: &str) -> bool {
+    let (root, child) = match path.split_once('.') {
+        Some((root, child)) => (root, Some(child)),
+        None => (path, None),
+    };
+    schema.iter().any(|item| match (item, child) {
+        (item, None) => schema_item_name(item) == root,
+        (SchemaItem::ReplicationGroup { name, children }, Some(child)) => {
+            &**name == root && children.iter().any(|item| schema_item_name(item) == child)
+        }
+        (SchemaItem::Scalar { .. }, Some(_)) => false,
+    })
 }
 
 /// Decode one bounded group of compatible, nonzero-subset messages.
@@ -6095,14 +6211,7 @@ fn decode_bounded_group(
     group: &MessageGroup<'_>,
     options: BoundedDecodeOptions<'_>,
 ) -> Result<RecordBatch, String> {
-    let BoundedDecodeOptions {
-        projection,
-        raw_code_paths,
-        list_value_filters,
-        policy,
-        fixed_replication,
-    } = options;
-    if fixed_replication == FixedReplicationLayout::Structural {
+    if options.fixed_replication == FixedReplicationLayout::Structural {
         return decode_structural_bounded_group(group, options);
     }
 
@@ -6110,11 +6219,25 @@ fn decode_bounded_group(
     let mut expanded = expand_descriptors(
         &template.descriptors,
         group.tables,
-        policy.strict,
+        options.policy.strict,
         FixedReplicationLayout::Flat,
     )?;
     append_data_category(&mut expanded);
     let mut schema = derive_schema(&expanded);
+    let present;
+    let options = if options.projection_missing == ProjectionMissing::Skip {
+        present = options.present_fields(|path| flat_path_present(&schema, path))?;
+        options.with_fields(&present)
+    } else {
+        options
+    };
+    let BoundedDecodeOptions {
+        projection,
+        raw_code_paths,
+        list_value_filters,
+        policy,
+        ..
+    } = options;
     apply_raw_code_paths(&expanded, &mut schema, raw_code_paths)?;
     let batch = if template.is_compressed {
         let (mut fields, arrays) = compressed_messages_to_columns(
@@ -7134,6 +7257,7 @@ impl BufrFileHandle {
         target_decoded_bytes: Option<usize>,
         fixed_replication: &str,
         skip_truncated_messages: bool,
+        projection_missing: &str,
     ) -> PyResult<BufrBatchIterator> {
         let options = ParsedDecodeOptions::parse(
             projection,
@@ -7141,6 +7265,7 @@ impl BufrFileHandle {
             list_value_filters,
             fixed_replication,
             skip_truncated_messages,
+            projection_missing,
         )
         .map_err(PyValueError::new_err)?;
         if messages_per_batch == 0 {
@@ -7206,6 +7331,7 @@ impl BufrFileHandle {
         list_value_filters: Option<Vec<(String, String, Vec<f64>)>>,
         fixed_replication: &str,
         skip_truncated_messages: bool,
+        projection_missing: &str,
     ) -> PyResult<Vec<PyRecordBatch>> {
         let parsed = ParsedDecodeOptions::parse(
             projection,
@@ -7213,6 +7339,7 @@ impl BufrFileHandle {
             list_value_filters,
             fixed_replication,
             skip_truncated_messages,
+            projection_missing,
         )
         .map_err(PyValueError::new_err)?;
         let state = Arc::clone(&self.state);

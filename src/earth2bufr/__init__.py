@@ -359,6 +359,7 @@ class BufrFile:
         target_decoded_bytes: int | None = None,
         fixed_replication: str = "flat",
         skip_truncated_messages: bool = False,
+        projection_missing: str = "raise",
     ) -> BatchIterator:
         """Decode the file as bounded Arrow batches in message order.
 
@@ -406,6 +407,11 @@ class BufrFile:
             Skip messages whose template extends past their Section 4 payload
             and record them in :attr:`BatchIterator.decode_failures`. Other
             decode errors still raise.
+        projection_missing : {"raise", "skip"}, default "raise"
+            What to do with a ``projection`` path that a decoded template does
+            not have. ``"raise"`` fails the decode; ``"skip"`` leaves the field
+            out of that template's batches, together with the
+            ``raw_code_paths`` and ``list_filters`` under it.
 
         Returns
         -------
@@ -434,6 +440,7 @@ class BufrFile:
                 target_decoded_bytes,
                 fixed_replication,
                 skip_truncated_messages,
+                projection_missing,
             )
         )
 
@@ -514,6 +521,7 @@ def read_bufr(
     data_category_filter: list[int] | None = None,
     fixed_replication: str = "flat",
     skip_truncated_messages: bool = False,
+    projection_missing: str = "raise",
     strict: bool = False,
     table_b_json: str | None = None,
     table_d_json: str | None = None,
@@ -528,8 +536,8 @@ def read_bufr(
     ``local_tables_json`` definitions are applied after embedded definitions.
 
     ``projection``, ``list_filters``, ``raw_code_paths``,
-    ``data_category_filter``, ``fixed_replication`` and
-    ``skip_truncated_messages`` mean what they mean in
+    ``data_category_filter``, ``fixed_replication``,
+    ``skip_truncated_messages`` and ``projection_missing`` mean what they mean in
     :meth:`BufrFile.iter_batches`, are validated the same way when this
     function is called, and apply while messages are decoded.
 
@@ -559,6 +567,9 @@ def read_bufr(
         skipped messages are not reported; :attr:`BatchIterator.decode_failures`
         from :meth:`BufrFile.iter_batches` lists them. Other decode errors
         still raise.
+    projection_missing : {"raise", "skip"}, default "raise"
+        ``"skip"`` leaves projected fields a template does not have out of
+        that template's batches instead of raising.
     strict : bool, default False
         As in :func:`open_bufr`.
     table_b_json : str, optional
@@ -656,6 +667,7 @@ def read_bufr(
             _native_list_filters(list_filters),
             fixed_replication,
             skip_truncated_messages,
+            projection_missing,
         )
 
     results = []
