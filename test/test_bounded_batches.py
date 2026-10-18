@@ -1293,10 +1293,11 @@ def test_message_table_columns_match_message_info(tmp_path: Path):
     info = earth2bufr.get_metadata(path)
     names = [field.name for field in dataclasses.fields(earth2bufr.MessageInfo)]
     assert info.message_table.schema.names == names
-    for name in names:
-        expected = [getattr(message, name) for message in info.messages]
-        column = info.message_table.column(name).to_pylist()
-        assert [tuple(value) if name == "descriptors" else value for value in column] == expected, name
+    rows = info.message_table.to_pylist()
+    assert len(rows) == len(info.messages)
+    for row, message in zip(rows, info.messages, strict=True):
+        assert {**row, "descriptors": tuple(row["descriptors"])} == dataclasses.asdict(message)
+        assert all(isinstance(descriptor, str) for descriptor in message.descriptors)
     assert None in info.message_table.column("table_epoch").to_pylist()
 
 

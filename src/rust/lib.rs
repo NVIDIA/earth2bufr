@@ -31,7 +31,7 @@ use arrow::array::{
 use arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
     BinaryType, ByteArrayType, DataType, Field, FieldRef, Fields, Float64Type, Int32Type, Schema,
-    Utf8Type,
+    UInt16Type, UInt64Type, UInt8Type, Utf8Type,
 };
 use arrow::util::bit_mask::set_bits;
 use arrow_select::concat::concat;
@@ -40,6 +40,8 @@ use arrow_select::take::take;
 use memchr::memmem;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
+use pyo3::IntoPyObjectExt;
 use pyo3_arrow::PyRecordBatch;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -7817,6 +7819,53 @@ fn get_num_threads_rust() -> PyResult<usize> {
         .current_num_threads())
 }
 
+/// One message table value as a Python object: `None` for null, `int`,
+/// `bool`, or a tuple of `str` for a list of strings.
+fn message_table_value(py: Python<'_>, column: &ArrayRef, row: usize) -> PyResult<PyObject> {
+    if column.is_null(row) {
+        return Ok(py.None());
+    }
+    match column.data_type() {
+        DataType::Boolean => column.as_boolean().value(row).into_py_any(py),
+        DataType::UInt8 => column
+            .as_primitive::<UInt8Type>()
+            .value(row)
+            .into_py_any(py),
+        DataType::UInt16 => column
+            .as_primitive::<UInt16Type>()
+            .value(row)
+            .into_py_any(py),
+        DataType::UInt64 => column
+            .as_primitive::<UInt64Type>()
+            .value(row)
+            .into_py_any(py),
+        DataType::List(_) => {
+            let values = column.as_list::<i32>().value(row);
+            let strings = values.as_string::<i32>();
+            PyTuple::new(py, strings.iter().map(Option::unwrap_or_default))?.into_py_any(py)
+        }
+        other => Err(PyValueError::new_err(format!(
+            "Unsupported message table column type {other}"
+        ))),
+    }
+}
+
+/// Rows of a message table as tuples of Python values in column order.
+#[pyfunction]
+fn message_rows_rust(py: Python<'_>, batch: PyRecordBatch) -> PyResult<Vec<Py<PyTuple>>> {
+    let batch = batch.into_inner();
+    (0..batch.num_rows())
+        .map(|row| {
+            let values = batch
+                .columns()
+                .iter()
+                .map(|column| message_table_value(py, column, row))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyTuple::new(py, values)?.unbind())
+        })
+        .collect()
+}
+
 /// Flatten one decoded batch with the same rules as `read_bufr(flatten=True)`.
 #[pyfunction]
 fn flatten_batch_rust(batch: PyRecordBatch) -> PyResult<PyRecordBatch> {
@@ -7831,6 +7880,7 @@ fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(flatten_batch_rust, m)?)?;
     m.add_function(wrap_pyfunction!(open_bufr_rust, m)?)?;
     m.add_function(wrap_pyfunction!(file_info_rust, m)?)?;
+    m.add_function(wrap_pyfunction!(message_rows_rust, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads_rust, m)?)?;
     m.add_function(wrap_pyfunction!(get_num_threads_rust, m)?)?;
     m.add_class::<BufrFileHandle>()?;

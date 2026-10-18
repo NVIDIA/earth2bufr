@@ -36,7 +36,7 @@ Example:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -244,9 +244,8 @@ class FileInfo:
     @cached_property
     def messages(self) -> tuple[MessageInfo, ...]:
         """Every message in file order, including DX table messages and messages without subsets."""
-        columns = {name: self.message_table.column(name).to_pylist() for name in _MESSAGE_FIELDS}
-        columns["descriptors"] = [tuple(descriptors) for descriptors in columns["descriptors"]]
-        return tuple(MessageInfo(*row) for row in zip(*columns.values(), strict=True))
+        # The table's columns are the MessageInfo fields in declaration order.
+        return tuple(MessageInfo(*row) for row in _get_lib().message_rows_rust(self.message_table))
 
     @cached_property
     def data_messages(self) -> tuple[MessageInfo, ...]:
@@ -269,9 +268,6 @@ class DecodeFailure:
 
     source_message_index: int
     reason: str
-
-
-_MESSAGE_FIELDS = tuple(field.name for field in fields(MessageInfo))
 
 
 def _file_info(native: tuple[Any, str]) -> FileInfo:
