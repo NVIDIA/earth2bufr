@@ -7438,9 +7438,10 @@ impl BufrFileHandle {
     }
 }
 
-/// Open and index a BUFR file once for bounded reads.
+/// Open and index a BUFR file once for bounded reads, without holding the GIL.
 #[pyfunction]
 fn open_bufr_rust(
+    py: Python<'_>,
     file_path: &str,
     table_b_json: &str,
     table_d_json: &str,
@@ -7448,25 +7449,37 @@ fn open_bufr_rust(
     strict: bool,
 ) -> PyResult<BufrFileHandle> {
     let tables = TableSet::from_json(table_b_json, table_d_json).map_err(PyValueError::new_err)?;
-    let read_error = |error| PyValueError::new_err(format!("Failed to read file: {error}"));
+    let file_path = file_path.to_owned();
+    let local_tables_json = local_tables_json.map(str::to_owned);
+    py.allow_threads(|| open_indexed(&file_path, tables, local_tables_json.as_deref(), strict))
+        .map(|state| BufrFileHandle {
+            state: Arc::new(state),
+        })
+        .map_err(PyValueError::new_err)
+}
+
+/// Read the message headers of a file and index its data messages.
+fn open_indexed(
+    file_path: &str,
+    tables: TableSet,
+    local_tables_json: Option<&str>,
+    strict: bool,
+) -> Result<BufrFileState, String> {
+    let read_error = |error| format!("Failed to read file: {error}");
     let mut source = FileSource::open(file_path).map_err(read_error)?;
     let (messages, spans) = read_message_headers(&mut source).map_err(read_error)?;
     if messages.is_empty() {
-        return Err(PyValueError::new_err("No BUFR messages found in file"));
+        return Err("No BUFR messages found in file".into());
     }
 
     let mut data_message_indices = Vec::new();
-    let mut epochs = extract_dx_table_epochs(&messages, &tables).map_err(|error| {
-        PyValueError::new_err(format!("Failed to extract DX table epochs: {error}"))
-    })?;
+    let mut epochs = extract_dx_table_epochs(&messages, &tables)
+        .map_err(|error| format!("Failed to extract DX table epochs: {error}"))?;
     // A file with no decodable data messages has no epochs; it opens and
     // yields no batches.
     if let Some(local_json) = local_tables_json {
         for epoch in &mut epochs {
-            epoch
-                .tables
-                .merge_local(local_json)
-                .map_err(PyValueError::new_err)?;
+            epoch.tables.merge_local(local_json)?;
         }
     }
     let message_epoch = message_epochs(messages.len(), &epochs);
@@ -7478,9 +7491,8 @@ fn open_bufr_rust(
         if quick_data_category(message) == Some(DX_TABLE_DATA_CATEGORY) {
             continue;
         }
-        let parsed = parse_message_header(message, spans[index].len()).map_err(|error| {
-            PyValueError::new_err(format!("Failed to index BUFR message {index}: {error}"))
-        })?;
+        let parsed = parse_message_header(message, spans[index].len())
+            .map_err(|error| format!("Failed to index BUFR message {index}: {error}"))?;
         if parsed.num_subsets == 0 {
             continue;
         }
@@ -7502,35 +7514,27 @@ fn open_bufr_rust(
                 let tables = epochs
                     .get(epoch)
                     .map(|epoch| &epoch.tables)
-                    .ok_or_else(|| {
-                        PyValueError::new_err(format!("BUFR message {index} has no DX table epoch"))
-                    })?;
+                    .ok_or_else(|| format!("BUFR message {index} has no DX table epoch"))?;
                 expand_descriptors(
                     &message.descriptors,
                     tables,
                     true,
                     FixedReplicationLayout::Flat,
                 )
-                .map_err(|error| {
-                    PyValueError::new_err(format!(
-                        "Strict BUFR template validation failed: {error}"
-                    ))
-                })?;
+                .map_err(|error| format!("Strict BUFR template validation failed: {error}"))?;
             }
         }
     }
 
-    Ok(BufrFileHandle {
-        state: Arc::new(BufrFileState {
-            file: source.file,
-            headers: messages,
-            spans,
-            data_message_indices,
-            message_index,
-            epochs,
-            message_epoch,
-            strict,
-        }),
+    Ok(BufrFileState {
+        file: source.file,
+        headers: messages,
+        spans,
+        data_message_indices,
+        message_index,
+        epochs,
+        message_epoch,
+        strict,
     })
 }
 
@@ -7712,22 +7716,27 @@ fn read_message_headers(
 ///
 /// Reads Sections 0-3 of each message and DX table messages whole. The JSON
 /// equals `BufrFileHandle.file_info` for the same file. Table epochs
-/// depend only on DX blocks, so base tables are not loaded.
+/// depend only on DX blocks, so base tables are not loaded. Runs without
+/// holding the GIL.
 #[pyfunction]
-fn file_info_rust(file_path: &str) -> PyResult<(PyRecordBatch, String)> {
-    let (messages, spans) = FileSource::open(file_path)
-        .and_then(|mut source| read_message_headers(&mut source))
-        .map_err(|error| PyValueError::new_err(format!("Failed to read file: {error}")))?;
-    if messages.is_empty() {
-        return Err(PyValueError::new_err("No BUFR messages found in file"));
-    }
-    let epochs = extract_dx_table_epochs(&messages, &TableSet::new()).map_err(|error| {
-        PyValueError::new_err(format!("Failed to extract DX table epochs: {error}"))
-    })?;
-    let message_epoch = message_epochs(messages.len(), &epochs);
-    file_info(&messages, &spans, &message_epoch, &epochs)
+fn file_info_rust(py: Python<'_>, file_path: &str) -> PyResult<(PyRecordBatch, String)> {
+    let file_path = file_path.to_owned();
+    py.allow_threads(|| read_file_info(&file_path))
         .map(|(batch, epochs)| (PyRecordBatch::new(batch), epochs))
         .map_err(PyValueError::new_err)
+}
+
+fn read_file_info(file_path: &str) -> Result<(RecordBatch, String), String> {
+    let (messages, spans) = FileSource::open(file_path)
+        .and_then(|mut source| read_message_headers(&mut source))
+        .map_err(|error| format!("Failed to read file: {error}"))?;
+    if messages.is_empty() {
+        return Err("No BUFR messages found in file".into());
+    }
+    let epochs = extract_dx_table_epochs(&messages, &TableSet::new())
+        .map_err(|error| format!("Failed to extract DX table epochs: {error}"))?;
+    let message_epoch = message_epochs(messages.len(), &epochs);
+    file_info(&messages, &spans, &message_epoch, &epochs)
 }
 
 /// Report each table epoch's embedded DX hash and the descriptors its DX block
