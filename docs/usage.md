@@ -96,17 +96,7 @@ with earth2bufr.open_bufr("crisf4.bufr") as source:
         consume_compact_spectra(batch)
 ```
 
-Matching entries keep source order, duplicates and list boundaries. Filter
-values are physical values, also when the key is one of the `raw_code_paths`,
-so a channel subset can keep its radiances and channel numbers as raw codes:
-
-```python
-source.iter_batches(
-    projection=["SAID", "FORN", "FOVN", "DRF16BIT.CHNM", "DRF16BIT.SRAD"],
-    list_filters=[ListValueFilter(field="DRF16BIT", key="CHNM", values=channels)],
-    raw_code_paths=["DRF16BIT.CHNM", "DRF16BIT.SRAD"],
-)
-```
+Matching entries keep source order, duplicates and list boundaries.
 
 A batch holds at most `messages_per_batch` data messages, in source order, and
 ends early where the data category, descriptor template, compression or table
@@ -416,7 +406,6 @@ BUFR message or a header cannot be read.
 ```python
 info = earth2bufr.get_metadata("observations.bufr")
 
-info.message_table      # the same headers as an Arrow RecordBatch, one row per message
 info.messages           # MessageInfo for every message, including DX table and empty messages
 info.data_messages      # messages that carry subsets
 info.table_epochs       # TableEpoch per table set
@@ -425,16 +414,6 @@ for message in info.data_messages:
     print(message.data_category, message.local_sub_category, message.center)
     print(message.subsets, message.compressed, message.descriptors[:3])
     print(message.year, message.month, message.day, message.hour, message.minute)
-```
-
-`message_table` has the fields of `MessageInfo` as columns. `messages` and
-`data_messages` build one `MessageInfo` per message on first access; files
-with many messages read columns from the table instead:
-
-```python
-table = info.message_table
-subcategory = table.column("local_sub_category").to_numpy()  # by source_message_index
-data_rows = table.filter(table.column("table_epoch").is_valid())
 ```
 
 ## Flattening Nested Output

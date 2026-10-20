@@ -236,10 +236,10 @@ def test_file_info_built_from_messages_equals_the_file_info_of_the_file(tmp_path
     built = earth2bufr.FileInfo(messages=opened.messages, table_epochs=opened.table_epochs)
 
     assert built == opened
-    assert built.message_table.schema == opened.message_table.schema
+    assert built._message_table.schema == opened._message_table.schema
     assert built.messages == opened.messages
     assert built.data_messages == opened.data_messages
-    assert earth2bufr.FileInfo(messages=(), table_epochs=()).message_table.num_rows == 0
+    assert earth2bufr.FileInfo(messages=(), table_epochs=())._message_table.num_rows == 0
 
 
 def test_get_metadata_rejects_a_file_without_bufr_messages(tmp_path: Path):

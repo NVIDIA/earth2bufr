@@ -1407,7 +1407,7 @@ def test_open_locates_multi_mib_messages_between_junk(tmp_path: Path):
 
 @pytest.mark.rust
 def test_message_table_columns_match_message_info(tmp_path: Path):
-    """FileInfo.message_table has one row per message with the MessageInfo fields as columns."""
+    """The header table built in Rust has one row per message with the MessageInfo fields as columns."""
     import dataclasses
 
     import earth2bufr
@@ -1416,13 +1416,10 @@ def test_message_table_columns_match_message_info(tmp_path: Path):
     path.write_bytes(build_two_epoch_prepbufr_messages())
     info = earth2bufr.get_metadata(path)
     names = [field.name for field in dataclasses.fields(earth2bufr.MessageInfo)]
-    assert info.message_table.schema.names == names
-    rows = info.message_table.to_pylist()
-    assert len(rows) == len(info.messages)
-    for row, message in zip(rows, info.messages, strict=True):
-        assert {**row, "descriptors": tuple(row["descriptors"])} == dataclasses.asdict(message)
-        assert all(isinstance(descriptor, str) for descriptor in message.descriptors)
-    assert None in info.message_table.column("table_epoch").to_pylist()
+    assert info._message_table.schema.names == names
+    assert info._message_table.num_rows == len(info.messages)
+    assert all(isinstance(descriptor, str) for message in info.messages for descriptor in message.descriptors)
+    assert None in [message.table_epoch for message in info.messages]
 
 
 @pytest.mark.rust

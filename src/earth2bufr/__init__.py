@@ -232,26 +232,26 @@ class TableEpoch:
 class FileInfo:
     """Message headers and table epochs of a BUFR file, read without decoding data.
 
-    ``message_table`` holds one row per message in file order, including DX
-    table messages and messages without subsets, with the fields of
-    :class:`MessageInfo` as columns. ``messages`` and ``data_messages`` build
-    ``MessageInfo`` objects from it on first access. ``FileInfo(messages,
-    table_epochs)`` builds the table from ``MessageInfo`` objects.
+    The headers are held as an internal Arrow table, one row per message in
+    file order, including DX table messages and messages without subsets.
+    ``messages`` and ``data_messages`` build ``MessageInfo`` objects from it on
+    first access. ``FileInfo(messages, table_epochs)`` builds the table from
+    ``MessageInfo`` objects.
     """
 
-    message_table: pa.RecordBatch
+    _message_table: pa.RecordBatch
     table_epochs: tuple[TableEpoch, ...]
 
     def __init__(self, messages: tuple[MessageInfo, ...], table_epochs: tuple[TableEpoch, ...]) -> None:
         """Describe a file by its messages, in file order, and its table epochs."""
-        object.__setattr__(self, "message_table", _message_table(messages))
+        object.__setattr__(self, "_message_table", _message_table(messages))
         object.__setattr__(self, "table_epochs", table_epochs)
         self.__dict__["messages"] = messages
 
     @classmethod
     def _from_message_table(cls, message_table: pa.RecordBatch, table_epochs: tuple[TableEpoch, ...]) -> FileInfo:
         info = cls.__new__(cls)
-        object.__setattr__(info, "message_table", message_table)
+        object.__setattr__(info, "_message_table", message_table)
         object.__setattr__(info, "table_epochs", table_epochs)
         return info
 
@@ -259,7 +259,7 @@ class FileInfo:
     def messages(self) -> tuple[MessageInfo, ...]:
         """Every message in file order, including DX table messages and messages without subsets."""
         # The table's columns are the MessageInfo fields in declaration order.
-        return tuple(MessageInfo(*row) for row in _get_lib().message_rows_rust(self.message_table))
+        return tuple(MessageInfo(*row) for row in _get_lib().message_rows_rust(self._message_table))
 
     @cached_property
     def data_messages(self) -> tuple[MessageInfo, ...]:
@@ -270,7 +270,7 @@ class FileInfo:
         """Equal when both describe the same messages and table epochs."""
         if not isinstance(other, FileInfo):
             return NotImplemented
-        return self.message_table.equals(other.message_table) and self.table_epochs == other.table_epochs
+        return self._message_table.equals(other._message_table) and self.table_epochs == other.table_epochs
 
 
 @dataclass(frozen=True)
@@ -417,9 +417,11 @@ class BufrFile:
         data_category_filter : list of int, optional
             Data categories to decode; other messages are skipped.
         list_filters : list of ListValueFilter, optional
-            Keep only the entries of repeated list fields whose key matches.
-            Flat layout only; each filtered field must be kept by
-            ``projection`` when one is given.
+            Keep only the entries of repeated list fields whose key is in
+            ``values``, in file order. ``values`` are compared with the key's
+            decoded value, also for a key listed in ``raw_code_paths``. Flat
+            layout only; each filtered field must be kept by ``projection``
+            when one is given.
         prefetch_batches : int, default 1
             Batches a background thread decodes ahead of the consumer, counting
             the one being decoded and not the one last returned. Without
@@ -585,9 +587,11 @@ def read_bufr(
         ``FIELD.CHILD``; structural mode accepts paths of any depth.
         ``_data_category`` is always kept.
     list_filters : list of ListValueFilter, optional
-        Keep only the entries of repeated list fields whose key matches.
-        Flat layout only; each filtered field must be kept by ``projection``
-        when one is given.
+        Keep only the entries of repeated list fields whose key is in
+        ``values``, in file order. ``values`` are compared with the key's
+        decoded value, also for a key listed in ``raw_code_paths``. Flat layout
+        only; each filtered field must be kept by ``projection`` when one is
+        given.
     raw_code_paths : list of str, optional
         Numeric fields to emit as stored integers, with BUFR missing values as
         nulls. Each must also be kept by ``projection`` when one is given.
