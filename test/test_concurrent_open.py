@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from synthetic.builders import build_flat_wmo_message, build_two_epoch_prepbufr_messages, surface_observation_case
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _read(path: Path):
