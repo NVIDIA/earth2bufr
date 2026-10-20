@@ -403,7 +403,7 @@ file-wide.
 ## Inspecting Metadata
 
 `get_metadata` reads Sections 0-3 of every message, and DX table messages
-whole, without reading data sections, and returns a `FileInfo` equal to
+whole, without decoding data sections, and returns a `FileInfo` equal to
 `open_bufr(path).info`. It raises `ValueError` when the file holds no complete
 BUFR message or a header cannot be read.
 

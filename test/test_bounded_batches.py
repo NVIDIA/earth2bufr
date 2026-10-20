@@ -1234,9 +1234,9 @@ def test_open_handle_exposes_cached_headers_and_actual_structure(tmp_path: Path)
     }
 
 
-def _with_section2(message: bytes) -> bytes:
+def _with_section2(message: bytes, local_data: bytes = b"ab") -> bytes:
     section1_end = 8 + int.from_bytes(message[8:11], "big")
-    section2 = (6).to_bytes(3, "big") + b"\x00ab"
+    section2 = (4 + len(local_data)).to_bytes(3, "big") + b"\x00" + local_data
     total = len(message) + len(section2)
     flagged = message[:17] + bytes([message[17] | 0x80]) + message[18:section1_end]
     return b"BUFR" + total.to_bytes(3, "big") + flagged[7:] + section2 + message[section1_end:]
@@ -1279,6 +1279,29 @@ def test_get_metadata_equals_open_file_info(tmp_path: Path, raw: bytes):
     with earth2bufr.open_bufr(path) as source:
         assert info == source.info
     assert info.data_messages
+
+
+@pytest.mark.rust
+def test_open_locates_multi_mib_messages_between_junk(tmp_path: Path):
+    """Messages of several MiB, junk between them and a truncated last message are located as in a small file."""
+    import earth2bufr
+
+    message = _with_section2(build_flat_wmo_message(surface_observation_case()), b"\x00" * (3 << 20))
+    raw = bytearray()
+    offsets = []
+    for gap in range(1, 10):
+        raw += b"\x00" * gap
+        offsets.append(len(raw))
+        raw += message
+    raw += message[: len(message) // 2]
+    path = tmp_path / "large_messages.bufr"
+    path.write_bytes(bytes(raw))
+
+    info = earth2bufr.get_metadata(path)
+    assert [entry.offset for entry in info.messages] == offsets
+    assert {entry.size_bytes for entry in info.messages} == {len(message)}
+    with earth2bufr.open_bufr(path) as source:
+        assert source.info == info
 
 
 @pytest.mark.rust

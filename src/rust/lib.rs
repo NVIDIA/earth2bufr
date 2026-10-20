@@ -51,7 +51,6 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -345,23 +344,25 @@ trait MessageSource {
     fn find_marker(&mut self, from: usize) -> Result<Option<usize>, Self::Error>;
 }
 
-/// Minimum bytes read from a file at a time. Reading the end marker of one
-/// message then also reads the start of the next.
-const FILE_READ_SIZE: usize = 4096;
+/// Minimum bytes read from a file at a time while locating messages, in
+/// `SCAN_CHUNK_SIZE` pieces read concurrently on the decode pool. Network file
+/// systems serve one small read per message slowly and concurrent large reads
+/// quickly.
+const SCAN_READ_SIZE: usize = 8 << 20;
+const SCAN_CHUNK_SIZE: usize = 1 << 20;
 
 /// Bytes searched for a marker first; each later step doubles, up to
 /// `MARKER_SEARCH_MAX`. Gaps between messages are usually a few padding bytes.
 const MARKER_SEARCH_START: usize = 256;
 const MARKER_SEARCH_MAX: usize = 1 << 20;
 
-/// A file read on demand, so locating messages does not load their contents.
+/// A file read on demand in windows of at least `SCAN_READ_SIZE` bytes.
 ///
 /// Keeps the two most recent reads: the scanner reads one message's end
 /// marker while its header is parsed from the read that found its start.
 struct FileSource {
     file: fs::File,
     len: usize,
-    position: usize,
     /// (file offset, bytes) of the two most recent reads.
     windows: [(usize, Vec<u8>); 2],
     newest: usize,
@@ -375,7 +376,6 @@ impl FileSource {
         Ok(Self {
             file,
             len,
-            position: 0,
             windows: [(0, Vec::new()), (0, Vec::new())],
             newest: 0,
         })
@@ -397,15 +397,11 @@ impl MessageSource for FileSource {
             Some(index) => index,
             None => {
                 let index = 1 - self.newest;
-                let read_len = buf.len().max(FILE_READ_SIZE).min(self.len - offset);
-                if offset != self.position {
-                    self.file.seek(SeekFrom::Start(offset as u64))?;
-                }
+                let read_len = buf.len().max(SCAN_READ_SIZE).min(self.len - offset);
                 let (start, bytes) = &mut self.windows[index];
                 bytes.resize(read_len, 0);
-                self.file.read_exact(bytes)?;
+                read_chunks_at(&self.file, bytes, offset)?;
                 *start = offset;
-                self.position = offset + read_len;
                 index
             }
         };
@@ -6350,7 +6346,7 @@ impl BufrFileState {
                 let previous = &self.spans[indices[position - 1]];
                 let next = &self.spans[indices[position]];
                 next.start < previous.end
-                    || next.start - previous.end > FILE_READ_SIZE
+                    || next.start - previous.end > FETCH_MAX_GAP
                     || next.end - read_start > FETCH_READ_SIZE
             };
             if split {
@@ -6400,6 +6396,26 @@ impl BufrFileState {
 /// Upper bound on one read of `BufrFileState::read_messages`, unless a single
 /// message is larger.
 const FETCH_READ_SIZE: usize = 1 << 20;
+
+/// Largest gap between two messages that one read of
+/// `BufrFileState::read_messages` spans.
+const FETCH_MAX_GAP: usize = 4096;
+
+/// Read `buf` from `offset` in `SCAN_CHUNK_SIZE` pieces, concurrently on the
+/// decode pool when it has more than one thread.
+fn read_chunks_at(file: &fs::File, buf: &mut [u8], offset: usize) -> std::io::Result<()> {
+    let pool = decode_pool().map_err(std::io::Error::other)?;
+    if buf.len() <= SCAN_CHUNK_SIZE || pool.current_num_threads() == 1 {
+        return read_exact_at(file, buf, offset as u64);
+    }
+    pool.install(|| {
+        buf.par_chunks_mut(SCAN_CHUNK_SIZE)
+            .enumerate()
+            .try_for_each(|(index, chunk)| {
+                read_exact_at(file, chunk, (offset + index * SCAN_CHUNK_SIZE) as u64)
+            })
+    })
+}
 
 fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(unix)]
