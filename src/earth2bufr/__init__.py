@@ -36,7 +36,7 @@ Example:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -228,18 +228,32 @@ class TableEpoch:
     redefines: tuple[TableRedefinition, ...]
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, init=False)
 class FileInfo:
     """Message headers and table epochs of a BUFR file, read without decoding data.
 
     ``message_table`` holds one row per message in file order, including DX
     table messages and messages without subsets, with the fields of
     :class:`MessageInfo` as columns. ``messages`` and ``data_messages`` build
-    ``MessageInfo`` objects from it on first access.
+    ``MessageInfo`` objects from it on first access. ``FileInfo(messages,
+    table_epochs)`` builds the table from ``MessageInfo`` objects.
     """
 
     message_table: pa.RecordBatch
     table_epochs: tuple[TableEpoch, ...]
+
+    def __init__(self, messages: tuple[MessageInfo, ...], table_epochs: tuple[TableEpoch, ...]) -> None:
+        """Describe a file by its messages, in file order, and its table epochs."""
+        object.__setattr__(self, "message_table", _message_table(messages))
+        object.__setattr__(self, "table_epochs", table_epochs)
+        self.__dict__["messages"] = messages
+
+    @classmethod
+    def _from_message_table(cls, message_table: pa.RecordBatch, table_epochs: tuple[TableEpoch, ...]) -> FileInfo:
+        info = cls.__new__(cls)
+        object.__setattr__(info, "message_table", message_table)
+        object.__setattr__(info, "table_epochs", table_epochs)
+        return info
 
     @cached_property
     def messages(self) -> tuple[MessageInfo, ...]:
@@ -281,7 +295,31 @@ def _file_info(native: tuple[Any, str]) -> FileInfo:
         )
         for epoch in json.loads(table_epochs_json)
     )
-    return FileInfo(pa.record_batch(message_table), table_epochs)
+    return FileInfo._from_message_table(pa.record_batch(message_table), table_epochs)
+
+
+def _message_table(messages: tuple[MessageInfo, ...]) -> pa.RecordBatch:
+    import pyarrow as pa
+
+    # The column types of the table `open_bufr` and `get_metadata` build in Rust.
+    u8, u16, u64 = pa.uint8(), pa.uint16(), pa.uint64()
+    types = {
+        "source_message_index": u64,
+        "offset": u64,
+        "size_bytes": u64,
+        "center": u16,
+        "sub_center": u16,
+        "year": u16,
+        "subsets": u16,
+        "optional_section_present": pa.bool_(),
+        "compressed": pa.bool_(),
+        "descriptors": pa.list_(pa.string()),
+        "table_epoch": u64,
+    }
+    names = [field.name for field in fields(MessageInfo)]
+    schema = pa.schema([pa.field(name, types.get(name, u8), nullable=name == "table_epoch") for name in names])
+    columns = [pa.array([getattr(message, field.name) for message in messages], type=field.type) for field in schema]
+    return pa.RecordBatch.from_arrays(columns, schema=schema)
 
 
 def _native_list_filters(list_filters: list[ListValueFilter] | None) -> list[tuple[str, str, list[float]]] | None:

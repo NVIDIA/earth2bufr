@@ -182,6 +182,24 @@ def test_file_info_locates_messages_and_their_table_epochs(tmp_path: Path):
     assert (redefinition.before["bit_width"], redefinition.after["bit_width"]) == (12, 8)
 
 
+def test_file_info_built_from_messages_equals_the_file_info_of_the_file(tmp_path: Path):
+    """FileInfo(messages=..., table_epochs=...) holds the same table, messages and epochs as the opened file."""
+    import earth2bufr
+
+    path = tmp_path / "two_epochs.prepbufr"
+    path.write_bytes(build_two_epoch_prepbufr_messages())
+    with earth2bufr.open_bufr(path) as source:
+        opened = source.info
+
+    built = earth2bufr.FileInfo(messages=opened.messages, table_epochs=opened.table_epochs)
+
+    assert built == opened
+    assert built.message_table.schema == opened.message_table.schema
+    assert built.messages == opened.messages
+    assert built.data_messages == opened.data_messages
+    assert earth2bufr.FileInfo(messages=(), table_epochs=()).message_table.num_rows == 0
+
+
 def test_get_metadata_rejects_a_file_without_bufr_messages(tmp_path: Path):
     import earth2bufr
 
