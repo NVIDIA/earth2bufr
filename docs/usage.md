@@ -28,8 +28,9 @@ batches = earth2bufr.read_bufr(
 ```
 
 `read_bufr` takes the decode options of `iter_batches` -- `projection`,
-`list_filters`, `raw_code_paths`, `data_category_filter`, `fixed_replication`
-and `skip_truncated_messages` -- with the same meaning and validation, and the
+`list_filters`, `raw_code_paths`, `data_category_filter`, `fixed_replication`,
+`skip_truncated_messages` and `projection_missing` -- with the same meaning and
+validation, and the
 `strict` option of `open_bufr`. Its batches carry `_data_category` and no
 provenance columns. The `mnemonics` argument is removed; `projection` replaces
 it and raises on fields a decoded template does not have.
@@ -119,6 +120,25 @@ the subset's position within the message.
 
 Projection in flat mode accepts `FIELD` and `FIELD.CHILD`; structural mode
 accepts deeper paths.
+
+A projected field that a decoded template does not have raises. In files that
+mix templates, such as NCEP satellite-wind dumps, `projection_missing="skip"`
+leaves it out of that template's batches instead, along with the
+`raw_code_paths` and `list_filters` under it; each template's batches keep the
+projected fields it has. A projected list whose template lacks a list filter's
+key counts as missing and is left out the same way:
+
+```python
+with earth2bufr.open_bufr("gdas.t00z.satwnd.tm00.bufr_d") as source:
+    for batch in source.iter_batches(
+        projection=["SAID", "CLAT", "CLATH", "CLON", "CLONH", "PRLC", "WDIR", "WSPD"],
+        projection_missing="skip",
+    ):
+        ...
+```
+
+A template with none of the projected fields gives batches with only
+`_data_category`, `_source_message_index` and `_source_subset_index`.
 
 ## Threads
 
@@ -251,6 +271,12 @@ bitmaps and values they announce decode as ordinary columns. Strict decoding
 rejects them. `2-03-000` (end of reference value changes) and `2-05-000` (zero
 characters) occupy no bits and decode in both modes.
 
+A Table D sequence that contains itself, directly or inside a replicated group,
+is a malformed table: it raises `ValueError` in both modes, naming the sequence
+or replication descriptor (at open time under `strict=True`, otherwise at the
+first message that uses it). Expansion stops after 100,000 inlined sequences or
+64 nested replications.
+
 `skip_truncated_messages` skips messages whose template extends past their
 Section 4 payload and decodes the rest; the iterator's `decode_failures` lists
 what was skipped. Without it, a truncated message raises under `strict=True` and
@@ -373,7 +399,7 @@ file-wide.
 ## Inspecting Metadata
 
 `get_metadata` reads Sections 0-3 of every message, and DX table messages
-whole, without reading data sections, and returns a `FileInfo` equal to
+whole, without decoding data sections, and returns a `FileInfo` equal to
 `open_bufr(path).info`. It raises `ValueError` when the file holds no complete
 BUFR message or a header cannot be read.
 

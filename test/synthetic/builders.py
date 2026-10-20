@@ -472,6 +472,21 @@ def build_ia5_missing_prepbufr(raw: bytes) -> bytes:
     return dx + data
 
 
+def build_self_referencing_sequence_messages(members: Sequence[tuple[int, int, int]]) -> bytes:
+    """Build a DX table whose sequence 3-63-001 has `members` (which include 3-63-001) and a message using it."""
+    payload = bytearray()
+    payload.append(0)  # Table A entries
+    payload.append(1)  # Table B entries
+    payload += _dx_table_b_entry(0, 63, 1, "SID", "Synthetic station identifier", "CCITT IA5", 0, 0, 32)
+    payload.append(1)  # Table D entries
+    payload += _dx_table_d_entry(3, 63, 1, "LOOP", "Sequence that contains itself", members)
+    dx = bufr_message([], bytes(payload), num_subsets=1, data_category=11)
+    writer = BitWriter()
+    writer.write_ascii("KDEN", 4)
+    data = bufr_message([desc(3, 63, 1)], writer.to_bytes(), num_subsets=1, data_category=102)
+    return dx + data
+
+
 def build_two_epoch_prepbufr_messages() -> bytes:
     """Build a PrepBUFR stream of two DX epochs that redefine one descriptor.
 

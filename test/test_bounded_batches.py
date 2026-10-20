@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -611,6 +612,106 @@ def test_changing_num_threads_keeps_the_output(tmp_path: Path):
     assert all(report["equal"])
 
 
+_FORK_AFTER_DECODE = """
+import os, signal, sys
+import pyarrow as pa
+import earth2bufr
+earth2bufr.set_num_threads(2)
+options = dict(messages_per_batch=1, prefetch_batches=2)
+with earth2bufr.open_bufr(sys.argv[1]) as source:
+    reference = pa.Table.from_batches(list(source.iter_batches(**options)))
+    pid = os.fork()
+    if pid == 0:
+        signal.alarm(20)
+        equal = pa.Table.from_batches(list(source.iter_batches(**options))).equals(reference)
+        os._exit(0 if equal else 1)
+    _, status = os.waitpid(pid, 0)
+print(status)
+"""
+
+_FORK_DURING_ITERATION = """
+import json, os, signal, sys
+import pyarrow as pa
+import earth2bufr
+earth2bufr.set_num_threads(2)
+options = dict(messages_per_batch=1, prefetch_batches=2)
+with earth2bufr.open_bufr(sys.argv[1]) as source:
+    reference = pa.Table.from_batches(list(source.iter_batches(**options)))
+    started = source.iter_batches(**options)
+    first = next(started)
+    pid = os.fork()
+    if pid == 0:
+        signal.alarm(20)
+        try:
+            next(started)
+            refused = False
+        except RuntimeError:
+            refused = True
+        del started
+        os._exit(0 if refused else 1)
+    _, status = os.waitpid(pid, 0)
+    parent_equal = pa.Table.from_batches([first, *started]).equals(reference)
+print(json.dumps(dict(status=status, parent_equal=parent_equal)))
+"""
+
+
+_FORK_AFTER_METADATA = """
+import os, signal, sys
+import earth2bufr
+earth2bufr.set_num_threads(2)
+reference = earth2bufr.get_metadata(sys.argv[1])
+pid = os.fork()
+if pid == 0:
+    signal.alarm(20)
+    with earth2bufr.open_bufr(sys.argv[1]) as source:
+        equal = source.info == reference and earth2bufr.get_metadata(sys.argv[1]) == reference
+    os._exit(0 if equal else 1)
+_, status = os.waitpid(pid, 0)
+print(status)
+"""
+
+
+def _run_fork_script(tmp_path: Path, script: str, padding: int = 0) -> str:
+    import subprocess
+    import sys
+
+    message = build_flat_wmo_message(surface_observation_case())
+    path = _write_messages(tmp_path, "fork.bufr", [message] * 4 + [b"\x00" * padding] + [message] * 4)
+    result = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", script, str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    return result.stdout
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_forked_child_decodes_after_the_parent_used_the_pool(tmp_path: Path):
+    """A child forked after a multi-thread decode decodes the same batches; a hang ends the child with SIGALRM."""
+    assert int(_run_fork_script(tmp_path, _FORK_AFTER_DECODE)) == 0
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_forked_child_refuses_an_iterator_the_parent_started(tmp_path: Path):
+    """An iterator started before fork raises RuntimeError in the child and drops there; the parent finishes it."""
+    import json
+
+    report = json.loads(_run_fork_script(tmp_path, _FORK_DURING_ITERATION))
+    assert report["status"] == 0
+    assert report["parent_equal"]
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_forked_child_opens_after_the_parent_read_metadata(tmp_path: Path):
+    """A child forked after get_metadata opens and reads metadata of a file the scan reads in several pieces."""
+    assert int(_run_fork_script(tmp_path, _FORK_AFTER_METADATA, padding=3 << 20)) == 0
+
+
 def _compressed_year_humidity_message(years: list[int], humidity: float | None) -> bytes:
     writer = BitWriter()
     for field, values in ((YEAR, years), (RELATIVE_HUMIDITY, [humidity] * len(years))):
@@ -854,7 +955,7 @@ def test_uncompressed_raw_code_path_preserves_missing_as_arrow_null(tmp_path: Pa
 
 @pytest.mark.rust
 def test_invalid_raw_code_requests_raise(tmp_path: Path):
-    """Raw-code paths must be kept by projection and cannot be combined with list filters."""
+    """Raw-code paths must be kept by projection."""
     import earth2bufr
 
     path = surface_observation_case().write(tmp_path)
@@ -866,13 +967,30 @@ def test_invalid_raw_code_requests_raise(tmp_path: Path):
             )
         )
 
-    nested = delayed_replication_case().write(tmp_path)
-    raw_code_paths = ["B031001.B012101"]
-    list_filters = [earth2bufr.ListValueFilter("B031001", "B010004", (85_000.0,))]
-    with earth2bufr.open_bufr(nested) as source, pytest.raises(ValueError):
-        source.iter_batches(raw_code_paths=raw_code_paths, list_filters=list_filters)
-    with pytest.raises(ValueError):
-        earth2bufr.read_bufr(nested, raw_code_paths=raw_code_paths, list_filters=list_filters)
+
+@pytest.mark.rust
+@pytest.mark.parametrize("compressed", [False, True])
+def test_list_filter_on_raw_code_key_matches_physical_values(tmp_path: Path, compressed: bool):
+    """A raw-code filter key is matched by its physical value; kept entries keep their codes."""
+    import earth2bufr
+
+    path = _write_messages(
+        tmp_path, "levels.bufr", [build_template_message(LEVELS, _levels_subsets(4, 3), compressed=compressed)]
+    )
+    keep = [earth2bufr.ListValueFilter("B031001", "B010004", (50_000.0, 51_020.0))]
+    raw = ["B031001.B010004", "B031001.B012101"]
+    with earth2bufr.open_bufr(path) as source:
+        batch = next(source.iter_batches(list_filters=keep, raw_code_paths=raw))
+    assert (
+        earth2bufr.read_bufr(path, list_filters=keep, raw_code_paths=raw)[0]
+        .column("B031001")
+        .equals(_column(batch, "B031001"))
+    )
+    assert _column(batch, "B031001").to_pylist() == [
+        [{"B010004": 5_000, "B012101": 25_400}],
+        [],
+        [{"B010004": 5_102, "B012101": None}],
+    ]
 
 
 @pytest.mark.rust
@@ -1217,9 +1335,9 @@ def test_open_handle_exposes_cached_headers_and_actual_structure(tmp_path: Path)
     }
 
 
-def _with_section2(message: bytes) -> bytes:
+def _with_section2(message: bytes, local_data: bytes = b"ab") -> bytes:
     section1_end = 8 + int.from_bytes(message[8:11], "big")
-    section2 = (6).to_bytes(3, "big") + b"\x00ab"
+    section2 = (4 + len(local_data)).to_bytes(3, "big") + b"\x00" + local_data
     total = len(message) + len(section2)
     flagged = message[:17] + bytes([message[17] | 0x80]) + message[18:section1_end]
     return b"BUFR" + total.to_bytes(3, "big") + flagged[7:] + section2 + message[section1_end:]
@@ -1262,6 +1380,46 @@ def test_get_metadata_equals_open_file_info(tmp_path: Path, raw: bytes):
     with earth2bufr.open_bufr(path) as source:
         assert info == source.info
     assert info.data_messages
+
+
+@pytest.mark.rust
+def test_open_locates_multi_mib_messages_between_junk(tmp_path: Path):
+    """Messages of several MiB, junk between them and a truncated last message are located as in a small file."""
+    import earth2bufr
+
+    message = _with_section2(build_flat_wmo_message(surface_observation_case()), b"\x00" * (3 << 20))
+    raw = bytearray()
+    offsets = []
+    for gap in range(1, 10):
+        raw += b"\x00" * gap
+        offsets.append(len(raw))
+        raw += message
+    raw += message[: len(message) // 2]
+    path = tmp_path / "large_messages.bufr"
+    path.write_bytes(bytes(raw))
+
+    info = earth2bufr.get_metadata(path)
+    assert [entry.offset for entry in info.messages] == offsets
+    assert {entry.size_bytes for entry in info.messages} == {len(message)}
+    with earth2bufr.open_bufr(path) as source:
+        assert source.info == info
+
+
+@pytest.mark.rust
+def test_message_table_columns_match_message_info(tmp_path: Path):
+    """The header table built in Rust has one row per message with the MessageInfo fields as columns."""
+    import dataclasses
+
+    import earth2bufr
+
+    path = tmp_path / "messages.bufr"
+    path.write_bytes(build_two_epoch_prepbufr_messages())
+    info = earth2bufr.get_metadata(path)
+    names = [field.name for field in dataclasses.fields(earth2bufr.MessageInfo)]
+    assert info._message_table.schema.names == names
+    assert info._message_table.num_rows == len(info.messages)
+    assert all(isinstance(descriptor, str) for message in info.messages for descriptor in message.descriptors)
+    assert None in [message.table_epoch for message in info.messages]
 
 
 @pytest.mark.rust
@@ -1685,6 +1843,77 @@ def _mixed_file(tmp_path: Path) -> Path:
         build_template_message(LEVELS, _levels_subsets(6, 2), compressed=False),
     ]
     return _write_messages(tmp_path, "mixed.bufr", messages)
+
+
+@pytest.mark.rust
+@pytest.mark.parametrize("fixed_replication", ["flat", "structural"])
+def test_projection_missing_skip_keeps_the_fields_each_template_has(tmp_path: Path, fixed_replication: str):
+    """projection_missing="skip" leaves out the projected fields a template lacks and keeps the rest."""
+    import earth2bufr
+
+    path = _mixed_file(tmp_path)
+    wind = "B011002" if fixed_replication == "flat" else "fixed_1_01_002__occ_0"
+    projection = ["B004001", "B031001.B010004", wind]
+    with earth2bufr.open_bufr(path) as source:
+        with pytest.raises(ValueError):
+            list(source.iter_batches(projection=projection, fixed_replication=fixed_replication))
+        full = list(source.iter_batches(fixed_replication=fixed_replication))
+        skipped = list(
+            source.iter_batches(projection=projection, fixed_replication=fixed_replication, projection_missing="skip")
+        )
+    assert [batch.num_rows for batch in skipped] == [batch.num_rows for batch in full]
+    for got, whole in zip(skipped, full, strict=True):
+        levels = "B031001" in whole.schema.names
+        assert set(got.schema.names) - set(PROVENANCE_COLUMNS) == {"B004001", "_data_category"} | (
+            {"B031001"} if levels else {wind}
+        )
+        assert _column(got, "B004001").equals(_column(whole, "B004001"))
+        if levels:
+            got_levels, whole_levels = _column(got, "B031001"), _column(whole, "B031001")
+            assert got_levels.type.value_type.names == ["B010004"]
+            assert got_levels.offsets.equals(whole_levels.offsets)
+            assert got_levels.values.field("B010004").equals(whole_levels.values.field("B010004"))
+        else:
+            assert _columns_by_name(got, wind) == _columns_by_name(whole, wind)
+
+
+@pytest.mark.rust
+def test_projection_missing_skip_applies_raw_codes_where_the_field_exists(tmp_path: Path):
+    """Raw-code paths under a skipped field are skipped with it; read_bufr takes the same option."""
+    import earth2bufr
+
+    path = _mixed_file(tmp_path)
+    projection = ["B004001", "B031001.B010004", "B011002"]
+    raw = ["B031001.B010004", "B011002"]
+    batches = earth2bufr.read_bufr(path, projection=projection, raw_code_paths=raw, projection_missing="skip")
+    fields = [field for batch in batches for field in batch.schema]
+    pressures = [field.type.value_type.field("B010004").type for field in fields if field.name == "B031001"]
+    winds = [field.type for field in fields if field.name == "B011002"]
+    assert pressures and set(pressures) == {pa.int32()}
+    assert winds and set(winds) == {pa.int32()}
+    with pytest.raises(ValueError):
+        earth2bufr.read_bufr(path, projection=projection, raw_code_paths=raw, projection_missing="null")
+
+
+@pytest.mark.rust
+def test_projection_missing_skip_leaves_out_a_list_without_the_filter_key(tmp_path: Path):
+    """A filtered list whose template lacks the filter key is left out of that template's batches."""
+    import earth2bufr
+
+    temperatures = (YEAR, Delayed((AIR_TEMPERATURE,)))
+    messages = [
+        build_template_message(LEVELS, _levels_subsets(0, 3), compressed=True),
+        build_template_message(temperatures, [[2001, [[260.0], [261.0]]]], compressed=False),
+    ]
+    path = _write_messages(tmp_path, "filter_key_missing.bufr", messages)
+    projection = ["B004001", "B031001"]
+    keep = [earth2bufr.ListValueFilter("B031001", "B010004", (50_010.0,))]
+    with earth2bufr.open_bufr(path) as source:
+        with pytest.raises(ValueError, match="Filter key 'B031001.B010004' was not found"):
+            list(source.iter_batches(projection=projection, list_filters=keep))
+        levels, temps = source.iter_batches(projection=projection, list_filters=keep, projection_missing="skip")
+    assert _column(levels, "B031001").to_pylist() == [[], [{"B010004": 50_010.0, "B012101": 250.0}], []]
+    assert set(temps.schema.names) - set(PROVENANCE_COLUMNS) == {"B004001", "_data_category"}
 
 
 def _runs(batches) -> list[pa.Table]:

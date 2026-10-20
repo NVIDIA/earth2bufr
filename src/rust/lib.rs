@@ -26,11 +26,12 @@ use arrow::array::{
     downcast_primitive_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
     AsArray, BooleanArray, FixedSizeListArray, Float64Array, Float64Builder, GenericByteArray,
     Int32Array, Int32Builder, ListArray, ListBuilder, RecordBatch, RecordBatchOptions, StringArray,
-    StringBuilder, StructArray, StructBuilder, UInt32Array, UInt64Array,
+    StringBuilder, StructArray, StructBuilder, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
-    BinaryType, ByteArrayType, DataType, Field, FieldRef, Fields, Float64Type, Schema, Utf8Type,
+    BinaryType, ByteArrayType, DataType, Field, FieldRef, Fields, Float64Type, Int32Type, Schema,
+    UInt16Type, UInt64Type, UInt8Type, Utf8Type,
 };
 use arrow::util::bit_mask::set_bits;
 use arrow_select::concat::concat;
@@ -39,6 +40,8 @@ use arrow_select::take::take;
 use memchr::memmem;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
+use pyo3::IntoPyObjectExt;
 use pyo3_arrow::PyRecordBatch;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -48,7 +51,6 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -327,7 +329,16 @@ struct OperatorState {
     associated_field_stack: Vec<u32>,
     /// Increase scale/width from operator 207 (Y value, 0 means inactive)
     increase_scale_width_y: u32,
+    /// Replication groups being expanded around the current descriptor.
+    replication_depth: usize,
+    /// Table D sequences inlined so far in this template.
+    sequence_expansions: usize,
 }
+
+/// Bounds on template expansion. A Table D sequence that contains itself, which
+/// a file's own DX table can define, would otherwise expand without end.
+const MAX_REPLICATION_DEPTH: usize = 64;
+const MAX_SEQUENCE_EXPANSIONS: usize = 100_000;
 
 // =============================================================================
 // BUFR Reading Functions
@@ -342,23 +353,25 @@ trait MessageSource {
     fn find_marker(&mut self, from: usize) -> Result<Option<usize>, Self::Error>;
 }
 
-/// Minimum bytes read from a file at a time. Reading the end marker of one
-/// message then also reads the start of the next.
-const FILE_READ_SIZE: usize = 4096;
+/// Minimum bytes read from a file at a time while locating messages, in
+/// `SCAN_CHUNK_SIZE` pieces read concurrently on the decode pool. Network file
+/// systems serve one small read per message slowly and concurrent large reads
+/// quickly.
+const SCAN_READ_SIZE: usize = 8 << 20;
+const SCAN_CHUNK_SIZE: usize = 1 << 20;
 
 /// Bytes searched for a marker first; each later step doubles, up to
 /// `MARKER_SEARCH_MAX`. Gaps between messages are usually a few padding bytes.
 const MARKER_SEARCH_START: usize = 256;
 const MARKER_SEARCH_MAX: usize = 1 << 20;
 
-/// A file read on demand, so locating messages does not load their contents.
+/// A file read on demand in windows of at least `SCAN_READ_SIZE` bytes.
 ///
 /// Keeps the two most recent reads: the scanner reads one message's end
 /// marker while its header is parsed from the read that found its start.
 struct FileSource {
     file: fs::File,
     len: usize,
-    position: usize,
     /// (file offset, bytes) of the two most recent reads.
     windows: [(usize, Vec<u8>); 2],
     newest: usize,
@@ -372,7 +385,6 @@ impl FileSource {
         Ok(Self {
             file,
             len,
-            position: 0,
             windows: [(0, Vec::new()), (0, Vec::new())],
             newest: 0,
         })
@@ -394,15 +406,11 @@ impl MessageSource for FileSource {
             Some(index) => index,
             None => {
                 let index = 1 - self.newest;
-                let read_len = buf.len().max(FILE_READ_SIZE).min(self.len - offset);
-                if offset != self.position {
-                    self.file.seek(SeekFrom::Start(offset as u64))?;
-                }
+                let read_len = buf.len().max(SCAN_READ_SIZE).min(self.len - offset);
                 let (start, bytes) = &mut self.windows[index];
                 bytes.resize(read_len, 0);
-                self.file.read_exact(bytes)?;
+                read_chunks_at(&self.file, bytes, offset)?;
                 *start = offset;
-                self.position = offset + read_len;
                 index
             }
         };
@@ -1094,6 +1102,28 @@ fn expand_descriptors(
     )
 }
 
+fn expand_replicated_group(
+    replication: u32,
+    group: &[u32],
+    tables: &TableSet,
+    state: &mut OperatorState,
+    strict: bool,
+    structural_fixed_replication: bool,
+) -> Result<Vec<ExpandedItem>, String> {
+    if state.replication_depth >= MAX_REPLICATION_DEPTH {
+        return Err(format!(
+            "Replication {} is nested more than {MAX_REPLICATION_DEPTH} levels deep; \
+             a Table D sequence may contain itself",
+            descriptor_to_string(replication)
+        ));
+    }
+    state.replication_depth += 1;
+    let expanded =
+        expand_descriptors_inner(group, tables, state, strict, structural_fixed_replication);
+    state.replication_depth -= 1;
+    expanded
+}
+
 fn expand_descriptors_inner(
     descriptors: &[u32],
     tables: &TableSet,
@@ -1101,6 +1131,8 @@ fn expand_descriptors_inner(
     strict: bool,
     structural_fixed_replication: bool,
 ) -> Result<Vec<ExpandedItem>, String> {
+    let mut inlined: Vec<u32>;
+    let mut descriptors = descriptors;
     let mut result = Vec::new();
     let mut i = 0;
 
@@ -1206,7 +1238,8 @@ fn expand_descriptors_inner(
                         })?;
 
                     let group_descs = &descriptors[i + 2..i + 2 + num_following];
-                    let expanded_group = expand_descriptors_inner(
+                    let expanded_group = expand_replicated_group(
+                        desc,
                         group_descs,
                         tables,
                         state,
@@ -1230,7 +1263,8 @@ fn expand_descriptors_inner(
                         ));
                     }
                     let group = &descriptors[i + 1..i + 1 + num_following];
-                    let expanded_group = expand_descriptors_inner(
+                    let expanded_group = expand_replicated_group(
+                        desc,
                         group,
                         tables,
                         state,
@@ -1352,23 +1386,23 @@ fn expand_descriptors_inner(
             3 => {
                 // Table D sequence - expand inline
                 if let Some(entry) = tables.table_d.get(&desc) {
+                    state.sequence_expansions += 1;
+                    if state.sequence_expansions > MAX_SEQUENCE_EXPANSIONS {
+                        return Err(format!(
+                            "Template expands more than {MAX_SEQUENCE_EXPANSIONS} Table D \
+                             sequences; {} may contain itself",
+                            descriptor_to_string(desc)
+                        ));
+                    }
                     // Inline the sequence's descriptors into the current level
-                    // by building a combined list of the remaining descriptors
+                    // and continue with the combined list.
                     let mut combined =
                         Vec::with_capacity(entry.descriptors.len() + descriptors.len() - i - 1);
                     combined.extend_from_slice(&entry.descriptors);
                     combined.extend_from_slice(&descriptors[i + 1..]);
-
-                    // Recursively expand the combined list
-                    let expanded = expand_descriptors_inner(
-                        &combined,
-                        tables,
-                        state,
-                        strict,
-                        structural_fixed_replication,
-                    )?;
-                    result.extend(expanded);
-                    return Ok(result);
+                    inlined = combined;
+                    descriptors = &inlined;
+                    i = 0;
                 } else {
                     return Err(format!(
                         "Unknown Table D descriptor {}",
@@ -4118,9 +4152,20 @@ fn parse_list_value_filters(
         .collect()
 }
 
+/// How the stored values of a filter key give the physical values a filter
+/// compares: as decoded, or as raw codes with this packing.
+#[derive(Clone, Copy)]
+enum KeyValues {
+    Physical,
+    RawCode { reference: i64, divisor: f64 },
+}
+
 /// Index of the filter key among the struct children of a `List<Struct>`
-/// field; the key must be a Float64 child.
-fn list_filter_key_index(field: &Field, filter: &ListValueFilterSpec) -> Result<usize, String> {
+/// field; the key must be a Float64 child or a raw-code Int32 child.
+fn list_filter_key_index(
+    field: &Field,
+    filter: &ListValueFilterSpec,
+) -> Result<(usize, KeyValues), String> {
     let DataType::List(item) = field.data_type() else {
         return Err(format!("Filter path '{}' is not a List array", filter.path));
     };
@@ -4134,13 +4179,24 @@ fn list_filter_key_index(field: &Field, filter: &ListValueFilterSpec) -> Result<
         .iter()
         .position(|child| *child.name() == filter.key)
         .ok_or_else(|| format!("Filter key '{}.{}' was not found", filter.path, filter.key))?;
-    if children[key].data_type() != &DataType::Float64 {
-        return Err(format!(
-            "Filter key '{}.{}' is not numeric Float64",
-            filter.path, filter.key
-        ));
+    let not_numeric = || format!("Filter key '{}.{}' is not numeric", filter.path, filter.key);
+    match children[key].data_type() {
+        DataType::Float64 => Ok((key, KeyValues::Physical)),
+        DataType::Int32 => {
+            let metadata = children[key].metadata();
+            let packing = |name: &str| metadata.get(name).ok_or_else(not_numeric);
+            let reference = packing("reference")?.parse().map_err(|_| not_numeric())?;
+            let scale: i32 = packing("scale")?.parse().map_err(|_| not_numeric())?;
+            Ok((
+                key,
+                KeyValues::RawCode {
+                    reference,
+                    divisor: 10f64.powi(scale),
+                },
+            ))
+        }
+        _ => Err(not_numeric()),
     }
-    Ok(key)
 }
 
 /// Filter entries of one `List<Struct>` while preserving outer row identity.
@@ -4149,13 +4205,18 @@ fn filter_list_struct_values(
     array: &ArrayRef,
     filter: &ListValueFilterSpec,
 ) -> Result<ArrayRef, String> {
-    let key_index = list_filter_key_index(field, filter)?;
+    let (key_index, key_values) = list_filter_key_index(field, filter)?;
     let list = array.as_list::<i32>();
-    let keys = list
-        .values()
-        .as_struct()
-        .column(key_index)
-        .as_primitive::<Float64Type>();
+    let keys = list.values().as_struct().column(key_index);
+    let physical = |index: usize| -> f64 {
+        match key_values {
+            KeyValues::Physical => keys.as_primitive::<Float64Type>().value(index),
+            KeyValues::RawCode { reference, divisor } => {
+                let code = keys.as_primitive::<Int32Type>().value(index);
+                (reference + i64::from(code)) as f64 / divisor
+            }
+        }
+    };
 
     let mut selected = Vec::new();
     let mut offsets = Vec::with_capacity(list.len() + 1);
@@ -4168,7 +4229,7 @@ fn filter_list_struct_values(
                 if keys.is_valid(index)
                     && filter
                         .values
-                        .contains(&numeric_filter_bits(keys.value(index)))
+                        .contains(&numeric_filter_bits(physical(index)))
                 {
                     selected.push(index as u64);
                 }
@@ -4323,6 +4384,99 @@ struct BoundedDecodeOptions<'a> {
     list_value_filters: Option<&'a [ListValueFilterSpec]>,
     policy: ReadPolicy,
     fixed_replication: FixedReplicationLayout,
+    projection_missing: ProjectionMissing,
+}
+
+/// What a decode does with projected fields a template does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionMissing {
+    Raise,
+    Skip,
+}
+
+impl ProjectionMissing {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "raise" => Ok(Self::Raise),
+            "skip" => Ok(Self::Skip),
+            other => Err(format!(
+                "projection_missing must be 'raise' or 'skip', got '{other}'"
+            )),
+        }
+    }
+}
+
+/// The projection, raw-code paths and list filters of one decode that name
+/// fields its template has.
+struct PresentFields {
+    projection: Option<Projection>,
+    raw_code_paths: Option<Vec<String>>,
+    list_value_filters: Option<Vec<ListValueFilterSpec>>,
+}
+
+impl<'a> BoundedDecodeOptions<'a> {
+    fn present_fields(&self, present: impl Fn(&str) -> bool) -> Result<PresentFields, String> {
+        // A projected filtered list counts as present only if it also has the
+        // filter key; without a projection a missing key still raises.
+        let present = |path: &str| {
+            let root = path.split('.').next().unwrap_or(path);
+            present(path)
+                && (self.projection.is_none()
+                    || self
+                        .list_value_filters
+                        .into_iter()
+                        .flatten()
+                        .filter(|filter| filter.path == root)
+                        .all(|filter| present(&format!("{}.{}", filter.path, filter.key))))
+        };
+        let projection = self
+            .projection
+            .map(|projection| {
+                let paths: Vec<String> = projection
+                    .paths
+                    .iter()
+                    .filter(|path| present(path))
+                    .cloned()
+                    .collect();
+                let tree = if paths.is_empty() {
+                    ProjectionTree::default()
+                } else {
+                    parse_projection_tree(&paths, self.fixed_replication)?
+                };
+                Ok::<_, String>(Projection { paths, tree })
+            })
+            .transpose()?;
+        let raw_code_paths = self
+            .raw_code_paths
+            .map(|paths| -> Vec<String> {
+                paths.iter().filter(|path| present(path)).cloned().collect()
+            })
+            .filter(|paths| !paths.is_empty());
+        let list_value_filters = self
+            .list_value_filters
+            .map(|filters| -> Vec<ListValueFilterSpec> {
+                filters
+                    .iter()
+                    .filter(|filter| present(&filter.path))
+                    .cloned()
+                    .collect()
+            })
+            .filter(|filters| !filters.is_empty());
+        Ok(PresentFields {
+            projection,
+            raw_code_paths,
+            list_value_filters,
+        })
+    }
+
+    fn with_fields(self, fields: &'a PresentFields) -> Self {
+        Self {
+            projection: fields.projection.as_ref(),
+            raw_code_paths: fields.raw_code_paths.as_deref(),
+            list_value_filters: fields.list_value_filters.as_deref(),
+            ..self
+        }
+    }
 }
 
 /// Decode options shared by `iter_batches` and `read_bufr`, validated and
@@ -4333,6 +4487,7 @@ struct ParsedDecodeOptions {
     list_value_filters: Option<Vec<ListValueFilterSpec>>,
     fixed_replication: FixedReplicationLayout,
     skip_truncated_messages: bool,
+    projection_missing: ProjectionMissing,
 }
 
 impl ParsedDecodeOptions {
@@ -4342,8 +4497,10 @@ impl ParsedDecodeOptions {
         list_value_filters: Option<Vec<(String, String, Vec<f64>)>>,
         fixed_replication: &str,
         skip_truncated_messages: bool,
+        projection_missing: &str,
     ) -> Result<Self, String> {
         let fixed_replication = FixedReplicationLayout::parse(fixed_replication)?;
+        let projection_missing = ProjectionMissing::parse(projection_missing)?;
         let projection = projection
             .map(|paths| Projection::parse(paths, fixed_replication))
             .transpose()?;
@@ -4393,9 +4550,6 @@ impl ParsedDecodeOptions {
         let list_value_filters = list_value_filters
             .map(parse_list_value_filters)
             .transpose()?;
-        if raw_code_paths.is_some() && list_value_filters.is_some() {
-            return Err("raw_code_paths cannot be combined with list filters".into());
-        }
         if fixed_replication == FixedReplicationLayout::Structural && list_value_filters.is_some() {
             return Err(
                 "list filters are not supported with fixed_replication='structural'".into(),
@@ -4419,6 +4573,7 @@ impl ParsedDecodeOptions {
             list_value_filters,
             fixed_replication,
             skip_truncated_messages,
+            projection_missing,
         })
     }
 
@@ -4434,6 +4589,7 @@ impl ParsedDecodeOptions {
                 reject_overrun: strict || self.skip_truncated_messages,
             },
             fixed_replication: self.fixed_replication,
+            projection_missing: self.projection_missing,
         }
     }
 }
@@ -5395,6 +5551,13 @@ fn decode_compressed_into_slots(
                         ),
                         None => kept,
                     };
+                    // An entry no subset keeps writes nothing and is stepped over.
+                    if element_kept.is_some_and(|flags| !flags.contains(&true)) {
+                        for item in group.iter() {
+                            skip_compressed_item(reader, item, n)?;
+                        }
+                        continue;
+                    }
                     decode_compressed_into_slots(reader, group, children, n, element_kept)?;
                 }
                 let mut placement = entries.place(kept)?;
@@ -5537,7 +5700,7 @@ fn compressed_messages_to_columns(
             .iter()
             .position(|field| *field.name() == filter.path)
             .ok_or_else(|| format!("List filter path '{}' was not decoded", filter.path))?;
-        let key = list_filter_key_index(&fields[index], filter)?;
+        let (key, _) = list_filter_key_index(&fields[index], filter)?;
         if let ColumnKind::List { filter: kept, .. } = &mut nodes[index].kind {
             *kept = Some(KeyFilter {
                 key,
@@ -6015,6 +6178,15 @@ fn decode_structural_bounded_group(
         FixedReplicationLayout::Structural,
     )?;
     let mut schema = derive_structural_schema(&expanded, None);
+    let present;
+    let options = if options.projection_missing == ProjectionMissing::Skip {
+        present = options.present_fields(|path| {
+            find_structural_item(&schema, &path.split('.').collect::<Vec<_>>()).is_some()
+        })?;
+        options.with_fields(&present)
+    } else {
+        options
+    };
     apply_structural_raw_code_paths(&mut schema, options.raw_code_paths)?;
     if let Some(projection) = options.projection {
         validate_structural_paths(&schema, &projection.paths, "Projection")?;
@@ -6053,9 +6225,31 @@ fn decode_structural_bounded_group(
             list_value_filters: None,
             policy: options.policy,
             fixed_replication: FixedReplicationLayout::Flat,
+            projection_missing: ProjectionMissing::Raise,
         },
     )?;
     restack_flat_batch_structurally(flat, &schema, selection)
+}
+
+fn schema_item_name(item: &SchemaItem) -> &str {
+    match item {
+        SchemaItem::Scalar { name, .. } | SchemaItem::ReplicationGroup { name, .. } => name,
+    }
+}
+
+/// Whether a flat `FIELD` or `FIELD.CHILD` path names a field of `schema`.
+fn flat_path_present(schema: &[SchemaItem], path: &str) -> bool {
+    let (root, child) = match path.split_once('.') {
+        Some((root, child)) => (root, Some(child)),
+        None => (path, None),
+    };
+    schema.iter().any(|item| match (item, child) {
+        (item, None) => schema_item_name(item) == root,
+        (SchemaItem::ReplicationGroup { name, children }, Some(child)) => {
+            &**name == root && children.iter().any(|item| schema_item_name(item) == child)
+        }
+        (SchemaItem::Scalar { .. }, Some(_)) => false,
+    })
 }
 
 /// Decode one bounded group of compatible, nonzero-subset messages.
@@ -6063,14 +6257,7 @@ fn decode_bounded_group(
     group: &MessageGroup<'_>,
     options: BoundedDecodeOptions<'_>,
 ) -> Result<RecordBatch, String> {
-    let BoundedDecodeOptions {
-        projection,
-        raw_code_paths,
-        list_value_filters,
-        policy,
-        fixed_replication,
-    } = options;
-    if fixed_replication == FixedReplicationLayout::Structural {
+    if options.fixed_replication == FixedReplicationLayout::Structural {
         return decode_structural_bounded_group(group, options);
     }
 
@@ -6078,11 +6265,25 @@ fn decode_bounded_group(
     let mut expanded = expand_descriptors(
         &template.descriptors,
         group.tables,
-        policy.strict,
+        options.policy.strict,
         FixedReplicationLayout::Flat,
     )?;
     append_data_category(&mut expanded);
     let mut schema = derive_schema(&expanded);
+    let present;
+    let options = if options.projection_missing == ProjectionMissing::Skip {
+        present = options.present_fields(|path| flat_path_present(&schema, path))?;
+        options.with_fields(&present)
+    } else {
+        options
+    };
+    let BoundedDecodeOptions {
+        projection,
+        raw_code_paths,
+        list_value_filters,
+        policy,
+        ..
+    } = options;
     apply_raw_code_paths(&expanded, &mut schema, raw_code_paths)?;
     let batch = if template.is_compressed {
         let (mut fields, arrays) = compressed_messages_to_columns(
@@ -6180,7 +6381,7 @@ impl BufrFileState {
                 let previous = &self.spans[indices[position - 1]];
                 let next = &self.spans[indices[position]];
                 next.start < previous.end
-                    || next.start - previous.end > FILE_READ_SIZE
+                    || next.start - previous.end > FETCH_MAX_GAP
                     || next.end - read_start > FETCH_READ_SIZE
             };
             if split {
@@ -6230,6 +6431,26 @@ impl BufrFileState {
 /// Upper bound on one read of `BufrFileState::read_messages`, unless a single
 /// message is larger.
 const FETCH_READ_SIZE: usize = 1 << 20;
+
+/// Largest gap between two messages that one read of
+/// `BufrFileState::read_messages` spans.
+const FETCH_MAX_GAP: usize = 4096;
+
+/// Read `buf` from `offset` in `SCAN_CHUNK_SIZE` pieces, concurrently on the
+/// decode pool when it has more than one thread.
+fn read_chunks_at(file: &fs::File, buf: &mut [u8], offset: usize) -> std::io::Result<()> {
+    let pool = decode_pool().map_err(std::io::Error::other)?;
+    if buf.len() <= SCAN_CHUNK_SIZE || pool.current_num_threads() == 1 {
+        return read_exact_at(file, buf, offset as u64);
+    }
+    pool.install(|| {
+        buf.par_chunks_mut(SCAN_CHUNK_SIZE)
+            .enumerate()
+            .try_for_each(|(index, chunk)| {
+                read_exact_at(file, chunk, (offset + index * SCAN_CHUNK_SIZE) as u64)
+            })
+    })
+}
 
 fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -6395,9 +6616,23 @@ fn schema_item_payload(item: &SchemaItem) -> Value {
     }
 }
 
-/// The rayon pool decodes run on. Built on first use and replaced by
-/// `set_num_threads`; a decode keeps the pool it started on.
-static DECODE_POOL: RwLock<Option<Arc<rayon::ThreadPool>>> = RwLock::new(None);
+/// The rayon pool decodes run on and the process that built it. Built on first
+/// use and replaced by `set_num_threads`; a decode keeps the pool it started on.
+struct DecodePool {
+    pool: Arc<rayon::ThreadPool>,
+    pid: u32,
+}
+
+static DECODE_POOL: RwLock<Option<DecodePool>> = RwLock::new(None);
+
+/// A forked child inherits the pool without its worker threads, so work sent to
+/// it never runs. The inherited pool is leaked rather than dropped: dropping it
+/// would signal threads that do not exist in this process.
+fn forget_inherited(pool: DecodePool) -> usize {
+    let threads = pool.pool.current_num_threads();
+    std::mem::forget(pool);
+    threads
+}
 
 /// Thread count from `EARTH2BUFR_NUM_THREADS`, else `RAYON_NUM_THREADS`, else the
 /// available parallelism. Unset, unparsable and zero values are skipped.
@@ -6427,21 +6662,31 @@ fn build_decode_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, String> {
         })
 }
 
-/// The current decode pool, built with `default_num_threads` on first use.
+/// The current decode pool, built with `default_num_threads` on first use. In a
+/// forked child, a pool built by the parent is replaced by one with the same
+/// thread count.
 fn decode_pool() -> Result<Arc<rayon::ThreadPool>, String> {
-    if let Some(pool) = DECODE_POOL
+    let pid = std::process::id();
+    if let Some(current) = DECODE_POOL
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
+        .filter(|current| current.pid == pid)
     {
-        return Ok(Arc::clone(pool));
+        return Ok(Arc::clone(&current.pool));
     }
     let mut slot = DECODE_POOL.write().unwrap_or_else(PoisonError::into_inner);
-    if let Some(pool) = slot.as_ref() {
-        return Ok(Arc::clone(pool));
+    if let Some(current) = slot.as_ref().filter(|current| current.pid == pid) {
+        return Ok(Arc::clone(&current.pool));
     }
-    let pool = build_decode_pool(default_num_threads())?;
-    *slot = Some(Arc::clone(&pool));
+    let threads = slot
+        .take()
+        .map_or_else(default_num_threads, forget_inherited);
+    let pool = build_decode_pool(threads)?;
+    *slot = Some(DecodePool {
+        pool: Arc::clone(&pool),
+        pid,
+    });
     Ok(pool)
 }
 
@@ -6669,9 +6914,12 @@ fn run_prefetch(mut planner: BatchPlanner, channel: &PrefetchChannel, prefetch_b
 }
 
 /// The prefetch thread of one iterator; dropping it stops and joins the thread.
+/// `pid` is the process that started the thread: a forked child has a copy of
+/// this handle but not the thread.
 struct Prefetch {
     channel: Arc<PrefetchChannel>,
     thread: Option<JoinHandle<()>>,
+    pid: u32,
 }
 
 impl Prefetch {
@@ -6687,7 +6935,12 @@ impl Prefetch {
         Ok(Self {
             channel,
             thread: Some(thread),
+            pid: std::process::id(),
         })
+    }
+
+    fn in_this_process(&self) -> bool {
+        self.pid == std::process::id()
     }
 
     /// The next decoded group in source order, or `None` once the producer is done.
@@ -6715,6 +6968,11 @@ impl Prefetch {
 
 impl Drop for Prefetch {
     fn drop(&mut self) {
+        if !self.in_this_process() {
+            // The thread and any lock it held exist only in the parent.
+            std::mem::forget(self.thread.take());
+            return;
+        }
         if self.thread.is_some() {
             // The producer finishes its current decode before it sees the stop.
             Python::with_gil(|py| {
@@ -6974,6 +7232,12 @@ impl BufrBatchIterator {
             let Some(prefetch) = self.prefetch.as_ref() else {
                 return Ok(None);
             };
+            if !prefetch.in_this_process() {
+                return Err(PyRuntimeError::new_err(
+                    "This BUFR batch iterator was started in a parent process; \
+                     iterate a new iter_batches() in the forked child",
+                ));
+            }
             match py.allow_threads(|| prefetch.next_group()) {
                 Some(Ok((batches, failures))) => {
                     self.ready_batches.extend(batches);
@@ -7006,15 +7270,16 @@ impl BufrBatchIterator {
 
 #[pymethods]
 impl BufrFileHandle {
-    /// Describe every message and DX table epoch from the cached index.
-    fn file_info_json(&self) -> PyResult<String> {
+    /// Message headers as Arrow and DX table epochs as JSON, from the cached index.
+    fn file_info(&self) -> PyResult<(PyRecordBatch, String)> {
         let state = &self.state;
-        file_info_json(
+        file_info(
             &state.headers,
             &state.spans,
             &state.message_epoch,
             &state.epochs,
         )
+        .map(|(batch, epochs)| (PyRecordBatch::new(batch), epochs))
         .map_err(PyValueError::new_err)
     }
 
@@ -7101,6 +7366,7 @@ impl BufrFileHandle {
         target_decoded_bytes: Option<usize>,
         fixed_replication: &str,
         skip_truncated_messages: bool,
+        projection_missing: &str,
     ) -> PyResult<BufrBatchIterator> {
         let options = ParsedDecodeOptions::parse(
             projection,
@@ -7108,6 +7374,7 @@ impl BufrFileHandle {
             list_value_filters,
             fixed_replication,
             skip_truncated_messages,
+            projection_missing,
         )
         .map_err(PyValueError::new_err)?;
         if messages_per_batch == 0 {
@@ -7173,6 +7440,7 @@ impl BufrFileHandle {
         list_value_filters: Option<Vec<(String, String, Vec<f64>)>>,
         fixed_replication: &str,
         skip_truncated_messages: bool,
+        projection_missing: &str,
     ) -> PyResult<Vec<PyRecordBatch>> {
         let parsed = ParsedDecodeOptions::parse(
             projection,
@@ -7180,6 +7448,7 @@ impl BufrFileHandle {
             list_value_filters,
             fixed_replication,
             skip_truncated_messages,
+            projection_missing,
         )
         .map_err(PyValueError::new_err)?;
         let state = Arc::clone(&self.state);
@@ -7247,9 +7516,10 @@ impl BufrFileHandle {
     }
 }
 
-/// Open and index a BUFR file once for bounded reads.
+/// Open and index a BUFR file once for bounded reads, without holding the GIL.
 #[pyfunction]
 fn open_bufr_rust(
+    py: Python<'_>,
     file_path: &str,
     table_b_json: &str,
     table_d_json: &str,
@@ -7257,25 +7527,37 @@ fn open_bufr_rust(
     strict: bool,
 ) -> PyResult<BufrFileHandle> {
     let tables = TableSet::from_json(table_b_json, table_d_json).map_err(PyValueError::new_err)?;
-    let read_error = |error| PyValueError::new_err(format!("Failed to read file: {error}"));
+    let file_path = file_path.to_owned();
+    let local_tables_json = local_tables_json.map(str::to_owned);
+    py.allow_threads(|| open_indexed(&file_path, tables, local_tables_json.as_deref(), strict))
+        .map(|state| BufrFileHandle {
+            state: Arc::new(state),
+        })
+        .map_err(PyValueError::new_err)
+}
+
+/// Read the message headers of a file and index its data messages.
+fn open_indexed(
+    file_path: &str,
+    tables: TableSet,
+    local_tables_json: Option<&str>,
+    strict: bool,
+) -> Result<BufrFileState, String> {
+    let read_error = |error| format!("Failed to read file: {error}");
     let mut source = FileSource::open(file_path).map_err(read_error)?;
     let (messages, spans) = read_message_headers(&mut source).map_err(read_error)?;
     if messages.is_empty() {
-        return Err(PyValueError::new_err("No BUFR messages found in file"));
+        return Err("No BUFR messages found in file".into());
     }
 
     let mut data_message_indices = Vec::new();
-    let mut epochs = extract_dx_table_epochs(&messages, &tables).map_err(|error| {
-        PyValueError::new_err(format!("Failed to extract DX table epochs: {error}"))
-    })?;
+    let mut epochs = extract_dx_table_epochs(&messages, &tables)
+        .map_err(|error| format!("Failed to extract DX table epochs: {error}"))?;
     // A file with no decodable data messages has no epochs; it opens and
     // yields no batches.
     if let Some(local_json) = local_tables_json {
         for epoch in &mut epochs {
-            epoch
-                .tables
-                .merge_local(local_json)
-                .map_err(PyValueError::new_err)?;
+            epoch.tables.merge_local(local_json)?;
         }
     }
     let message_epoch = message_epochs(messages.len(), &epochs);
@@ -7287,9 +7569,8 @@ fn open_bufr_rust(
         if quick_data_category(message) == Some(DX_TABLE_DATA_CATEGORY) {
             continue;
         }
-        let parsed = parse_message_header(message, spans[index].len()).map_err(|error| {
-            PyValueError::new_err(format!("Failed to index BUFR message {index}: {error}"))
-        })?;
+        let parsed = parse_message_header(message, spans[index].len())
+            .map_err(|error| format!("Failed to index BUFR message {index}: {error}"))?;
         if parsed.num_subsets == 0 {
             continue;
         }
@@ -7311,35 +7592,27 @@ fn open_bufr_rust(
                 let tables = epochs
                     .get(epoch)
                     .map(|epoch| &epoch.tables)
-                    .ok_or_else(|| {
-                        PyValueError::new_err(format!("BUFR message {index} has no DX table epoch"))
-                    })?;
+                    .ok_or_else(|| format!("BUFR message {index} has no DX table epoch"))?;
                 expand_descriptors(
                     &message.descriptors,
                     tables,
                     true,
                     FixedReplicationLayout::Flat,
                 )
-                .map_err(|error| {
-                    PyValueError::new_err(format!(
-                        "Strict BUFR template validation failed: {error}"
-                    ))
-                })?;
+                .map_err(|error| format!("Strict BUFR template validation failed: {error}"))?;
             }
         }
     }
 
-    Ok(BufrFileHandle {
-        state: Arc::new(BufrFileState {
-            file: source.file,
-            headers: messages,
-            spans,
-            data_message_indices,
-            message_index,
-            epochs,
-            message_epoch,
-            strict,
-        }),
+    Ok(BufrFileState {
+        file: source.file,
+        headers: messages,
+        spans,
+        data_message_indices,
+        message_index,
+        epochs,
+        message_epoch,
+        strict,
     })
 }
 
@@ -7354,98 +7627,117 @@ fn message_epochs(message_count: usize, epochs: &[TableEpoch]) -> Vec<usize> {
     message_epoch
 }
 
-/// One `MessageInfo` as serialized to Python.
-#[derive(Serialize)]
-struct MessageInfoRecord {
-    source_message_index: usize,
-    offset: usize,
-    size_bytes: usize,
-    edition: u8,
-    master_table: u8,
-    center: u16,
-    sub_center: u16,
-    update_sequence: u8,
-    optional_section_present: bool,
-    data_category: u8,
-    international_sub_category: u8,
-    local_sub_category: u8,
-    master_table_version: u8,
-    local_table_version: u8,
-    year: u16,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
-    subsets: u16,
-    compressed: bool,
-    section3_flags: u8,
-    #[serde(serialize_with = "serialize_descriptors")]
-    descriptors: Vec<u32>,
-    table_epoch: Option<usize>,
-}
-
-fn serialize_descriptors<S: serde::Serializer>(
-    descriptors: &[u32],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serializer.collect_seq(descriptors.iter().map(|value| descriptor_to_string(*value)))
-}
-
-#[derive(Serialize)]
-struct FileInfoRecord {
-    messages: Vec<MessageInfoRecord>,
-    table_epochs: Vec<Value>,
-}
-
-/// Describe every message and DX table epoch as JSON.
+/// Message headers, one Arrow row per message with the columns of
+/// `MessageInfo`, and the table epochs as JSON.
 ///
 /// `messages[i]` holds at least Sections 0-3 and the Section 4 header of the
 /// message at `spans[i]` in the file, and DX messages whole.
-fn file_info_json(
+fn file_info(
     messages: &[BufrMessage],
     spans: &[std::ops::Range<usize>],
     message_epoch: &[usize],
     epochs: &[TableEpoch],
-) -> Result<String, String> {
-    let mut infos = Vec::with_capacity(messages.len());
-    for (index, (message, span)) in messages.iter().zip(spans).enumerate() {
-        let parsed = parse_message_header(message, span.len())
-            .map_err(|error| format!("Failed to read BUFR message {index}: {error}"))?;
-        let epoch = message_epoch[index];
-        infos.push(MessageInfoRecord {
-            source_message_index: index,
-            offset: span.start,
-            size_bytes: span.len(),
-            edition: parsed.edition,
-            master_table: parsed.master_table,
-            center: parsed.center,
-            sub_center: parsed.sub_center,
-            update_sequence: parsed.update_sequence,
-            optional_section_present: parsed.optional_section_present,
-            data_category: parsed.data_category,
-            international_sub_category: parsed.intl_sub_category,
-            local_sub_category: parsed.local_sub_category,
-            master_table_version: parsed.master_table_version,
-            local_table_version: parsed.local_table_version,
-            year: parsed.year,
-            month: parsed.month,
-            day: parsed.day,
-            hour: parsed.hour,
-            minute: parsed.minute,
-            second: parsed.second,
-            subsets: parsed.num_subsets,
-            compressed: parsed.is_compressed,
-            section3_flags: parsed.section3_flags,
-            descriptors: parsed.descriptors,
-            table_epoch: (epoch != usize::MAX).then_some(epoch),
-        });
+) -> Result<(RecordBatch, String), String> {
+    let headers = messages
+        .iter()
+        .zip(spans)
+        .enumerate()
+        .map(|(index, (message, span))| {
+            parse_message_header(message, span.len())
+                .map_err(|error| format!("Failed to read BUFR message {index}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut descriptors = ListBuilder::new(StringBuilder::new());
+    for header in &headers {
+        for descriptor in &header.descriptors {
+            descriptors
+                .values()
+                .append_value(descriptor_to_string(*descriptor));
+        }
+        descriptors.append(true);
     }
-    let record = FileInfoRecord {
-        messages: infos,
-        table_epochs: table_epoch_report(messages, epochs)?,
+    let u8s = |value: fn(&ParsedMessage<'_>) -> u8| -> ArrayRef {
+        Arc::new(UInt8Array::from_iter_values(headers.iter().map(value)))
     };
-    serde_json::to_string(&record).map_err(|error| error.to_string())
+    let u16s = |value: fn(&ParsedMessage<'_>) -> u16| -> ArrayRef {
+        Arc::new(UInt16Array::from_iter_values(headers.iter().map(value)))
+    };
+    let bools = |value: fn(&ParsedMessage<'_>) -> bool| -> ArrayRef {
+        Arc::new(BooleanArray::from_iter(
+            headers.iter().map(|header| Some(value(header))),
+        ))
+    };
+    let u64s = |values: Vec<u64>| -> ArrayRef { Arc::new(UInt64Array::from(values)) };
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        (
+            "source_message_index",
+            u64s((0..headers.len() as u64).collect()),
+        ),
+        (
+            "offset",
+            u64s(spans.iter().map(|span| span.start as u64).collect()),
+        ),
+        (
+            "size_bytes",
+            u64s(spans.iter().map(|span| span.len() as u64).collect()),
+        ),
+        ("edition", u8s(|header| header.edition)),
+        ("master_table", u8s(|header| header.master_table)),
+        ("center", u16s(|header| header.center)),
+        ("sub_center", u16s(|header| header.sub_center)),
+        ("update_sequence", u8s(|header| header.update_sequence)),
+        (
+            "optional_section_present",
+            bools(|header| header.optional_section_present),
+        ),
+        ("data_category", u8s(|header| header.data_category)),
+        (
+            "international_sub_category",
+            u8s(|header| header.intl_sub_category),
+        ),
+        (
+            "local_sub_category",
+            u8s(|header| header.local_sub_category),
+        ),
+        (
+            "master_table_version",
+            u8s(|header| header.master_table_version),
+        ),
+        (
+            "local_table_version",
+            u8s(|header| header.local_table_version),
+        ),
+        ("year", u16s(|header| header.year)),
+        ("month", u8s(|header| header.month)),
+        ("day", u8s(|header| header.day)),
+        ("hour", u8s(|header| header.hour)),
+        ("minute", u8s(|header| header.minute)),
+        ("second", u8s(|header| header.second)),
+        ("subsets", u16s(|header| header.num_subsets)),
+        ("compressed", bools(|header| header.is_compressed)),
+        ("section3_flags", u8s(|header| header.section3_flags)),
+        ("descriptors", Arc::new(descriptors.finish())),
+        (
+            "table_epoch",
+            Arc::new(UInt64Array::from_iter(
+                message_epoch
+                    .iter()
+                    .map(|epoch| (*epoch != usize::MAX).then_some(*epoch as u64)),
+            )),
+        ),
+    ];
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|(name, array)| Field::new(*name, array.data_type().clone(), *name == "table_epoch"))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns.into_iter().map(|(_, array)| array).collect(),
+    )
+    .map_err(|error| format!("Message header table error: {error}"))?;
+    let table_epochs = serde_json::to_string(&table_epoch_report(messages, epochs)?)
+        .map_err(|error| error.to_string())?;
+    Ok((batch, table_epochs))
 }
 
 /// Parse a message read up to at least its Section 4 header, out of
@@ -7501,21 +7793,28 @@ fn read_message_headers(
 /// Describe a BUFR file's messages and table epochs from their headers.
 ///
 /// Reads Sections 0-3 of each message and DX table messages whole. The JSON
-/// equals `BufrFileHandle.file_info_json` for the same file. Table epochs
-/// depend only on DX blocks, so base tables are not loaded.
+/// equals `BufrFileHandle.file_info` for the same file. Table epochs
+/// depend only on DX blocks, so base tables are not loaded. Runs without
+/// holding the GIL.
 #[pyfunction]
-fn file_info_rust(file_path: &str) -> PyResult<String> {
+fn file_info_rust(py: Python<'_>, file_path: &str) -> PyResult<(PyRecordBatch, String)> {
+    let file_path = file_path.to_owned();
+    py.allow_threads(|| read_file_info(&file_path))
+        .map(|(batch, epochs)| (PyRecordBatch::new(batch), epochs))
+        .map_err(PyValueError::new_err)
+}
+
+fn read_file_info(file_path: &str) -> Result<(RecordBatch, String), String> {
     let (messages, spans) = FileSource::open(file_path)
         .and_then(|mut source| read_message_headers(&mut source))
-        .map_err(|error| PyValueError::new_err(format!("Failed to read file: {error}")))?;
+        .map_err(|error| format!("Failed to read file: {error}"))?;
     if messages.is_empty() {
-        return Err(PyValueError::new_err("No BUFR messages found in file"));
+        return Err("No BUFR messages found in file".into());
     }
-    let epochs = extract_dx_table_epochs(&messages, &TableSet::new()).map_err(|error| {
-        PyValueError::new_err(format!("Failed to extract DX table epochs: {error}"))
-    })?;
+    let epochs = extract_dx_table_epochs(&messages, &TableSet::new())
+        .map_err(|error| format!("Failed to extract DX table epochs: {error}"))?;
     let message_epoch = message_epochs(messages.len(), &epochs);
-    file_info_json(&messages, &spans, &message_epoch, &epochs).map_err(PyValueError::new_err)
+    file_info(&messages, &spans, &message_epoch, &epochs)
 }
 
 /// Report each table epoch's embedded DX hash and the descriptors its DX block
@@ -7624,7 +7923,14 @@ fn set_num_threads_rust(threads: usize) -> PyResult<()> {
         ));
     }
     let pool = build_decode_pool(threads).map_err(PyRuntimeError::new_err)?;
-    *DECODE_POOL.write().unwrap_or_else(PoisonError::into_inner) = Some(pool);
+    let pid = std::process::id();
+    let previous = DECODE_POOL
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(DecodePool { pool, pid });
+    if let Some(inherited) = previous.filter(|previous| previous.pid != pid) {
+        forget_inherited(inherited);
+    }
     Ok(())
 }
 
@@ -7634,6 +7940,53 @@ fn get_num_threads_rust() -> PyResult<usize> {
     Ok(decode_pool()
         .map_err(PyRuntimeError::new_err)?
         .current_num_threads())
+}
+
+/// One message table value as a Python object: `None` for null, `int`,
+/// `bool`, or a tuple of `str` for a list of strings.
+fn message_table_value(py: Python<'_>, column: &ArrayRef, row: usize) -> PyResult<PyObject> {
+    if column.is_null(row) {
+        return Ok(py.None());
+    }
+    match column.data_type() {
+        DataType::Boolean => column.as_boolean().value(row).into_py_any(py),
+        DataType::UInt8 => column
+            .as_primitive::<UInt8Type>()
+            .value(row)
+            .into_py_any(py),
+        DataType::UInt16 => column
+            .as_primitive::<UInt16Type>()
+            .value(row)
+            .into_py_any(py),
+        DataType::UInt64 => column
+            .as_primitive::<UInt64Type>()
+            .value(row)
+            .into_py_any(py),
+        DataType::List(_) => {
+            let values = column.as_list::<i32>().value(row);
+            let strings = values.as_string::<i32>();
+            PyTuple::new(py, strings.iter().map(Option::unwrap_or_default))?.into_py_any(py)
+        }
+        other => Err(PyValueError::new_err(format!(
+            "Unsupported message table column type {other}"
+        ))),
+    }
+}
+
+/// Rows of a message table as tuples of Python values in column order.
+#[pyfunction]
+fn message_rows_rust(py: Python<'_>, batch: PyRecordBatch) -> PyResult<Vec<Py<PyTuple>>> {
+    let batch = batch.into_inner();
+    (0..batch.num_rows())
+        .map(|row| {
+            let values = batch
+                .columns()
+                .iter()
+                .map(|column| message_table_value(py, column, row))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyTuple::new(py, values)?.unbind())
+        })
+        .collect()
 }
 
 /// Flatten one decoded batch with the same rules as `read_bufr(flatten=True)`.
@@ -7650,6 +8003,7 @@ fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(flatten_batch_rust, m)?)?;
     m.add_function(wrap_pyfunction!(open_bufr_rust, m)?)?;
     m.add_function(wrap_pyfunction!(file_info_rust, m)?)?;
+    m.add_function(wrap_pyfunction!(message_rows_rust, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads_rust, m)?)?;
     m.add_function(wrap_pyfunction!(get_num_threads_rust, m)?)?;
     m.add_class::<BufrFileHandle>()?;

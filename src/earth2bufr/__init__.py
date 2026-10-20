@@ -36,7 +36,7 @@ Example:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -145,7 +145,9 @@ class ListValueFilter:
     key : str
         Numeric child used for matching, for example ``"CHNM"``.
     values : tuple of float
-        Exact finite values to retain. Source order and duplicates are kept.
+        Exact finite values to retain, compared with the key's physical value
+        also when the key is in ``raw_code_paths``. Source order and
+        duplicates are kept.
 
     """
 
@@ -226,21 +228,49 @@ class TableEpoch:
     redefines: tuple[TableRedefinition, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, init=False)
 class FileInfo:
     """Message headers and table epochs of a BUFR file, read without decoding data.
 
-    ``messages`` covers every message in file order, including DX table
-    messages and messages without subsets.
+    The headers are held as an internal Arrow table, one row per message in
+    file order, including DX table messages and messages without subsets.
+    ``messages`` and ``data_messages`` build ``MessageInfo`` objects from it on
+    first access. ``FileInfo(messages, table_epochs)`` builds the table from
+    ``MessageInfo`` objects.
     """
 
-    messages: tuple[MessageInfo, ...]
+    _message_table: pa.RecordBatch
     table_epochs: tuple[TableEpoch, ...]
 
-    @property
+    def __init__(self, messages: tuple[MessageInfo, ...], table_epochs: tuple[TableEpoch, ...]) -> None:
+        """Describe a file by its messages, in file order, and its table epochs."""
+        object.__setattr__(self, "_message_table", _message_table(messages))
+        object.__setattr__(self, "table_epochs", table_epochs)
+        self.__dict__["messages"] = messages
+
+    @classmethod
+    def _from_message_table(cls, message_table: pa.RecordBatch, table_epochs: tuple[TableEpoch, ...]) -> FileInfo:
+        info = cls.__new__(cls)
+        object.__setattr__(info, "_message_table", message_table)
+        object.__setattr__(info, "table_epochs", table_epochs)
+        return info
+
+    @cached_property
+    def messages(self) -> tuple[MessageInfo, ...]:
+        """Every message in file order, including DX table messages and messages without subsets."""
+        # The table's columns are the MessageInfo fields in declaration order.
+        return tuple(MessageInfo(*row) for row in _get_lib().message_rows_rust(self._message_table))
+
+    @cached_property
     def data_messages(self) -> tuple[MessageInfo, ...]:
         """Messages that carry subsets, excluding DX table messages."""
         return tuple(message for message in self.messages if message.table_epoch is not None)
+
+    def __eq__(self, other: object) -> bool:
+        """Equal when both describe the same messages and table epochs."""
+        if not isinstance(other, FileInfo):
+            return NotImplemented
+        return self._message_table.equals(other._message_table) and self.table_epochs == other.table_epochs
 
 
 @dataclass(frozen=True)
@@ -254,21 +284,43 @@ class DecodeFailure:
     reason: str
 
 
-def _message_info(message: dict[str, Any]) -> MessageInfo:
-    fields: dict[str, Any] = {**message, "descriptors": tuple(message["descriptors"])}
-    return MessageInfo(**fields)
+def _file_info(native: tuple[Any, str]) -> FileInfo:
+    import pyarrow as pa
 
-
-def _file_info(payload: dict[str, Any]) -> FileInfo:
-    messages = tuple(_message_info(message) for message in payload["messages"])
+    message_table, table_epochs_json = native
     table_epochs = tuple(
         TableEpoch(
             embedded_table_sha256=epoch["embedded_table_sha256"],
             redefines=tuple(TableRedefinition(**item) for item in epoch["redefines"]),
         )
-        for epoch in payload["table_epochs"]
+        for epoch in json.loads(table_epochs_json)
     )
-    return FileInfo(messages, table_epochs)
+    return FileInfo._from_message_table(pa.record_batch(message_table), table_epochs)
+
+
+def _message_table(messages: tuple[MessageInfo, ...]) -> pa.RecordBatch:
+    import pyarrow as pa
+
+    # The column types of the table `open_bufr` and `get_metadata` build in Rust.
+    u8, u16, u64 = pa.uint8(), pa.uint16(), pa.uint64()
+    types = {
+        "source_message_index": u64,
+        "offset": u64,
+        "size_bytes": u64,
+        "center": u16,
+        "sub_center": u16,
+        "year": u16,
+        "subsets": u16,
+        "optional_section_present": pa.bool_(),
+        "compressed": pa.bool_(),
+        "descriptors": pa.list_(pa.string()),
+        "table_epoch": u64,
+    }
+    names = [field.name for field in fields(MessageInfo)]
+    schema = pa.schema([pa.field(name, types.get(name, u8), nullable=name == "table_epoch") for name in names])
+    # Cast, so integer flags such as 0 and 1 are accepted for the boolean columns.
+    columns = [pa.array([getattr(message, field.name) for message in messages]).cast(field.type) for field in schema]
+    return pa.RecordBatch.from_arrays(columns, schema=schema)
 
 
 def _native_list_filters(list_filters: list[ListValueFilter] | None) -> list[tuple[str, str, list[float]]] | None:
@@ -342,6 +394,7 @@ class BufrFile:
         target_decoded_bytes: int | None = None,
         fixed_replication: str = "flat",
         skip_truncated_messages: bool = False,
+        projection_missing: str = "raise",
     ) -> BatchIterator:
         """Decode the file as bounded Arrow batches in message order.
 
@@ -361,13 +414,14 @@ class BufrFile:
         raw_code_paths : list of str, optional
             Numeric fields to emit as stored integers, with BUFR missing values
             as nulls. Each must also be kept by ``projection`` when one is given.
-            Cannot be combined with ``list_filters``.
         data_category_filter : list of int, optional
             Data categories to decode; other messages are skipped.
         list_filters : list of ListValueFilter, optional
-            Keep only the entries of repeated list fields whose key matches.
-            Flat layout only; each filtered field must be kept by
-            ``projection`` when one is given.
+            Keep only the entries of repeated list fields whose key is in
+            ``values``, in file order. ``values`` are compared with the key's
+            decoded value, also for a key listed in ``raw_code_paths``. Flat
+            layout only; each filtered field must be kept by ``projection``
+            when one is given.
         prefetch_batches : int, default 1
             Batches a background thread decodes ahead of the consumer, counting
             the one being decoded and not the one last returned. Without
@@ -390,6 +444,11 @@ class BufrFile:
             Skip messages whose template extends past their Section 4 payload
             and record them in :attr:`BatchIterator.decode_failures`. Other
             decode errors still raise.
+        projection_missing : {"raise", "skip"}, default "raise"
+            What to do with a ``projection`` path that a decoded template does
+            not have. ``"raise"`` fails the decode; ``"skip"`` leaves the field
+            out of that template's batches, together with the
+            ``raw_code_paths`` and ``list_filters`` under it.
 
         Returns
         -------
@@ -418,13 +477,14 @@ class BufrFile:
                 target_decoded_bytes,
                 fixed_replication,
                 skip_truncated_messages,
+                projection_missing,
             )
         )
 
     @cached_property
     def info(self) -> FileInfo:
         """Message headers and table epochs of the file."""
-        return _file_info(json.loads(self._native().file_info_json()))
+        return _file_info(self._native().file_info())
 
     def source_structure(self, source_message_index: int) -> dict[str, Any]:
         """Describe the template, tables and effective packing that decode one message.
@@ -498,6 +558,7 @@ def read_bufr(
     data_category_filter: list[int] | None = None,
     fixed_replication: str = "flat",
     skip_truncated_messages: bool = False,
+    projection_missing: str = "raise",
     strict: bool = False,
     table_b_json: str | None = None,
     table_d_json: str | None = None,
@@ -512,8 +573,8 @@ def read_bufr(
     ``local_tables_json`` definitions are applied after embedded definitions.
 
     ``projection``, ``list_filters``, ``raw_code_paths``,
-    ``data_category_filter``, ``fixed_replication`` and
-    ``skip_truncated_messages`` mean what they mean in
+    ``data_category_filter``, ``fixed_replication``,
+    ``skip_truncated_messages`` and ``projection_missing`` mean what they mean in
     :meth:`BufrFile.iter_batches`, are validated the same way when this
     function is called, and apply while messages are decoded.
 
@@ -526,13 +587,14 @@ def read_bufr(
         ``FIELD.CHILD``; structural mode accepts paths of any depth.
         ``_data_category`` is always kept.
     list_filters : list of ListValueFilter, optional
-        Keep only the entries of repeated list fields whose key matches.
-        Flat layout only; each filtered field must be kept by ``projection``
-        when one is given.
+        Keep only the entries of repeated list fields whose key is in
+        ``values``, in file order. ``values`` are compared with the key's
+        decoded value, also for a key listed in ``raw_code_paths``. Flat layout
+        only; each filtered field must be kept by ``projection`` when one is
+        given.
     raw_code_paths : list of str, optional
         Numeric fields to emit as stored integers, with BUFR missing values as
         nulls. Each must also be kept by ``projection`` when one is given.
-        Cannot be combined with ``list_filters``.
     data_category_filter : list of int, optional
         Data categories to decode, which also orders the categories within a
         table epoch. If None, all categories are read.
@@ -544,6 +606,9 @@ def read_bufr(
         skipped messages are not reported; :attr:`BatchIterator.decode_failures`
         from :meth:`BufrFile.iter_batches` lists them. Other decode errors
         still raise.
+    projection_missing : {"raise", "skip"}, default "raise"
+        ``"skip"`` leaves projected fields a template does not have out of
+        that template's batches instead of raising.
     strict : bool, default False
         As in :func:`open_bufr`.
     table_b_json : str, optional
@@ -641,6 +706,7 @@ def read_bufr(
             _native_list_filters(list_filters),
             fixed_replication,
             skip_truncated_messages,
+            projection_missing,
         )
 
     results = []
@@ -681,7 +747,7 @@ def get_metadata(file_path: str | Path) -> FileInfo:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"BUFR file not found: {path}")
-    return _file_info(json.loads(_get_lib().file_info_rust(str(path))))
+    return _file_info(_get_lib().file_info_rust(str(path)))
 
 
 def set_num_threads(threads: int) -> None:
