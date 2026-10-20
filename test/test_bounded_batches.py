@@ -711,6 +711,7 @@ def test_forked_child_opens_after_the_parent_read_metadata(tmp_path: Path):
     """A child forked after get_metadata opens and reads metadata of a file the scan reads in several pieces."""
     assert int(_run_fork_script(tmp_path, _FORK_AFTER_METADATA, padding=3 << 20)) == 0
 
+
 def _compressed_year_humidity_message(years: list[int], humidity: float | None) -> bytes:
     writer = BitWriter()
     for field, values in ((YEAR, years), (RELATIVE_HUMIDITY, [humidity] * len(years))):
