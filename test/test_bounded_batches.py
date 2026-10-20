@@ -655,12 +655,28 @@ print(json.dumps(dict(status=status, parent_equal=parent_equal)))
 """
 
 
-def _run_fork_script(tmp_path: Path, script: str) -> str:
+_FORK_AFTER_METADATA = """
+import os, signal, sys
+import earth2bufr
+earth2bufr.set_num_threads(2)
+reference = earth2bufr.get_metadata(sys.argv[1])
+pid = os.fork()
+if pid == 0:
+    signal.alarm(20)
+    with earth2bufr.open_bufr(sys.argv[1]) as source:
+        equal = source.info == reference and earth2bufr.get_metadata(sys.argv[1]) == reference
+    os._exit(0 if equal else 1)
+_, status = os.waitpid(pid, 0)
+print(status)
+"""
+
+
+def _run_fork_script(tmp_path: Path, script: str, padding: int = 0) -> str:
     import subprocess
     import sys
 
     message = build_flat_wmo_message(surface_observation_case())
-    path = _write_messages(tmp_path, "fork.bufr", [message] * 8)
+    path = _write_messages(tmp_path, "fork.bufr", [message] * 4 + [b"\x00" * padding] + [message] * 4)
     result = subprocess.run(
         [sys.executable, "-W", "ignore", "-c", script, str(path)],
         capture_output=True,
@@ -688,6 +704,12 @@ def test_forked_child_refuses_an_iterator_the_parent_started(tmp_path: Path):
     assert report["status"] == 0
     assert report["parent_equal"]
 
+
+@pytest.mark.rust
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_forked_child_opens_after_the_parent_read_metadata(tmp_path: Path):
+    """A child forked after get_metadata opens and reads metadata of a file the scan reads in several pieces."""
+    assert int(_run_fork_script(tmp_path, _FORK_AFTER_METADATA, padding=3 << 20)) == 0
 
 def _compressed_year_humidity_message(years: list[int], humidity: float | None) -> bytes:
     writer = BitWriter()
