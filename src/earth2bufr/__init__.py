@@ -318,7 +318,8 @@ def _message_table(messages: tuple[MessageInfo, ...]) -> pa.RecordBatch:
     }
     names = [field.name for field in fields(MessageInfo)]
     schema = pa.schema([pa.field(name, types.get(name, u8), nullable=name == "table_epoch") for name in names])
-    columns = [pa.array([getattr(message, field.name) for message in messages], type=field.type) for field in schema]
+    # Cast, so integer flags such as 0 and 1 are accepted for the boolean columns.
+    columns = [pa.array([getattr(message, field.name) for message in messages]).cast(field.type) for field in schema]
     return pa.RecordBatch.from_arrays(columns, schema=schema)
 
 
