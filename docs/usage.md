@@ -135,7 +135,8 @@ A projected field that a decoded template does not have raises. In files that
 mix templates, such as NCEP satellite-wind dumps, `projection_missing="skip"`
 leaves it out of that template's batches instead, along with the
 `raw_code_paths` and `list_filters` under it; each template's batches keep the
-projected fields it has:
+projected fields it has. A projected list whose template lacks a list filter's
+key counts as missing and is left out the same way:
 
 ```python
 with earth2bufr.open_bufr("gdas.t00z.satwnd.tm00.bufr_d") as source:

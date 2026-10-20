@@ -1774,6 +1774,27 @@ def test_projection_missing_skip_applies_raw_codes_where_the_field_exists(tmp_pa
         earth2bufr.read_bufr(path, projection=projection, raw_code_paths=raw, projection_missing="null")
 
 
+@pytest.mark.rust
+def test_projection_missing_skip_leaves_out_a_list_without_the_filter_key(tmp_path: Path):
+    """A filtered list whose template lacks the filter key is left out of that template's batches."""
+    import earth2bufr
+
+    temperatures = (YEAR, Delayed((AIR_TEMPERATURE,)))
+    messages = [
+        build_template_message(LEVELS, _levels_subsets(0, 3), compressed=True),
+        build_template_message(temperatures, [[2001, [[260.0], [261.0]]]], compressed=False),
+    ]
+    path = _write_messages(tmp_path, "filter_key_missing.bufr", messages)
+    projection = ["B004001", "B031001"]
+    keep = [earth2bufr.ListValueFilter("B031001", "B010004", (50_010.0,))]
+    with earth2bufr.open_bufr(path) as source:
+        with pytest.raises(ValueError, match="Filter key 'B031001.B010004' was not found"):
+            list(source.iter_batches(projection=projection, list_filters=keep))
+        levels, temps = source.iter_batches(projection=projection, list_filters=keep, projection_missing="skip")
+    assert _column(levels, "B031001").to_pylist() == [[], [{"B010004": 50_010.0, "B012101": 250.0}], []]
+    assert set(temps.schema.names) - set(PROVENANCE_COLUMNS) == {"B004001", "_data_category"}
+
+
 def _runs(batches) -> list[pa.Table]:
     """Consecutive batches with one schema, joined."""
     runs: list[list[pa.RecordBatch]] = []

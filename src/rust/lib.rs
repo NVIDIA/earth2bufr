@@ -4385,6 +4385,19 @@ struct PresentFields {
 
 impl<'a> BoundedDecodeOptions<'a> {
     fn present_fields(&self, present: impl Fn(&str) -> bool) -> Result<PresentFields, String> {
+        // A projected filtered list counts as present only if it also has the
+        // filter key; without a projection a missing key still raises.
+        let present = |path: &str| {
+            let root = path.split('.').next().unwrap_or(path);
+            present(path)
+                && (self.projection.is_none()
+                    || self
+                        .list_value_filters
+                        .into_iter()
+                        .flatten()
+                        .filter(|filter| filter.path == root)
+                        .all(|filter| present(&format!("{}.{}", filter.path, filter.key))))
+        };
         let projection = self
             .projection
             .map(|projection| {
