@@ -6479,7 +6479,28 @@ fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Resul
 /// Cached BUFR file index and tables for bounded reads.
 #[pyclass]
 struct BufrFileHandle {
-    state: Arc<BufrFileState>,
+    state: DropWithoutGil<Arc<BufrFileState>>,
+}
+
+/// A value dropped with the GIL released, for values whose drop frees many allocations.
+struct DropWithoutGil<T: Send>(Option<T>);
+
+impl<T: Send> std::ops::Deref for DropWithoutGil<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0
+            .as_ref()
+            .expect("the value is only taken when dropped")
+    }
+}
+
+impl<T: Send> Drop for DropWithoutGil<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            Python::with_gil(|py| py.allow_threads(move || drop(value)));
+        }
+    }
 }
 
 fn collect_active_descriptors(
@@ -7271,14 +7292,16 @@ impl BufrBatchIterator {
 #[pymethods]
 impl BufrFileHandle {
     /// Message headers as Arrow and DX table epochs as JSON, from the cached index.
-    fn file_info(&self) -> PyResult<(PyRecordBatch, String)> {
-        let state = &self.state;
-        file_info(
-            &state.headers,
-            &state.spans,
-            &state.message_epoch,
-            &state.epochs,
-        )
+    fn file_info(&self, py: Python<'_>) -> PyResult<(PyRecordBatch, String)> {
+        let state: &BufrFileState = &self.state;
+        py.allow_threads(|| {
+            file_info(
+                &state.headers,
+                &state.spans,
+                &state.message_epoch,
+                &state.epochs,
+            )
+        })
         .map(|(batch, epochs)| (PyRecordBatch::new(batch), epochs))
         .map_err(PyValueError::new_err)
     }
@@ -7531,7 +7554,7 @@ fn open_bufr_rust(
     let local_tables_json = local_tables_json.map(str::to_owned);
     py.allow_threads(|| open_indexed(&file_path, tables, local_tables_json.as_deref(), strict))
         .map(|state| BufrFileHandle {
-            state: Arc::new(state),
+            state: DropWithoutGil(Some(Arc::new(state))),
         })
         .map_err(PyValueError::new_err)
 }
