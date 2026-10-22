@@ -534,6 +534,24 @@ def build_bytcnt_framed_messages(subsets: Sequence[bytes], *, value_bits: int = 
     return dx_message, data_message
 
 
+def build_restated_message_type_messages() -> bytes:
+    """Build a DX table whose Table A names SYNOBS, then a data message whose Section 3 lists SYNOBS
+    followed by its own members again, as NCEP GOES radiance dumps do. The data holds SYNOBS once."""
+    table_a = f"{'063':3}{'SYNOBS':<8}{'Synthetic observation message type':<56}"
+    payload = bytearray([1]) + table_a.encode("ascii") + _build_dx_table_payload()[1:]
+    dx_message = bufr_message([], bytes(payload), num_subsets=1, data_category=11)
+    writer = BitWriter()
+    writer.write_ascii("KDEN", 4)
+    writer.write_bits(round(273.1 * 10 - 2500), 12)
+    data_message = bufr_message(
+        [desc(3, 63, 1), desc(0, 63, 1), desc(0, 63, 2)],
+        writer.to_bytes(),
+        num_subsets=1,
+        data_category=102,
+    )
+    return dx_message + data_message
+
+
 def _dx_table_b_entry(
     f: int,
     x: int,

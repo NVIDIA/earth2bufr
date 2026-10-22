@@ -118,6 +118,8 @@ struct TableSet {
     table_b: FxHashMap<u32, Arc<TableBEntry>>,
     /// Table D entries keyed by F-X-Y descriptor integer
     table_d: FxHashMap<u32, Arc<TableDEntry>>,
+    /// Table D descriptors that DX tables name in Table A as message types.
+    message_types: HashSet<u32>,
 }
 
 impl TableSet {
@@ -126,6 +128,7 @@ impl TableSet {
         Self {
             table_b: FxHashMap::default(),
             table_d: FxHashMap::default(),
+            message_types: HashSet::new(),
         }
     }
 
@@ -151,7 +154,11 @@ impl TableSet {
             .filter_map(|(k, v)| parse_descriptor_key(&k).map(|d| (d, Arc::new(v))))
             .collect();
 
-        Ok(Self { table_b, table_d })
+        Ok(Self {
+            table_b,
+            table_d,
+            message_types: HashSet::new(),
+        })
     }
 
     /// Merge local tables (center-specific overrides).
@@ -192,6 +199,7 @@ impl TableSet {
         for (k, v) in other.table_d {
             self.table_d.insert(k, v);
         }
+        self.message_types.extend(other.message_types);
     }
 }
 
@@ -886,6 +894,7 @@ fn extract_dx_table_epochs(
 fn extract_dx_tables(messages: &[BufrMessage], dx_indices: &[usize]) -> Result<TableSet, String> {
     let mut combined_b: FxHashMap<u32, Arc<TableBEntry>> = FxHashMap::default();
     let mut combined_d: FxHashMap<u32, Arc<TableDEntry>> = FxHashMap::default();
+    let mut message_type_mnemonics: HashSet<String> = HashSet::new();
 
     for &index in dx_indices {
         let parsed = parse_message(&messages[index])
@@ -898,13 +907,18 @@ fn extract_dx_tables(messages: &[BufrMessage], dx_indices: &[usize]) -> Result<T
 
         let mut offset: usize = 0;
 
-        // --- Table A: skip (category, mnemonic, description) ---
+        // --- Table A: (category, mnemonic, description); keep the mnemonics ---
         if offset >= data.len() {
             continue;
         }
         let n_a = data[offset] as usize;
         offset += 1;
         // Each Table A entry is 67 bytes (3 + 8 + 56 chars)
+        for entry in data[offset..].as_chunks::<67>().0.iter().take(n_a) {
+            if let Ok(mnemonic) = std::str::from_utf8(&entry[3..11]) {
+                message_type_mnemonics.insert(mnemonic.trim().to_string());
+            }
+        }
         offset += n_a * 67;
         if offset >= data.len() {
             continue;
@@ -1076,9 +1090,15 @@ fn extract_dx_tables(messages: &[BufrMessage], dx_indices: &[usize]) -> Result<T
         return Err("No table entries extracted from DX messages".to_string());
     }
 
+    let message_types = combined_d
+        .iter()
+        .filter(|(_, entry)| message_type_mnemonics.contains(entry.mnemonic.as_ref()))
+        .map(|(descriptor, _)| *descriptor)
+        .collect();
     Ok(TableSet {
         table_b: combined_b,
         table_d: combined_d,
+        message_types,
     })
 }
 
@@ -1093,6 +1113,7 @@ fn expand_descriptors(
     strict: bool,
     fixed_replication: FixedReplicationLayout,
 ) -> Result<Vec<ExpandedItem>, String> {
+    let descriptors = message_type_template(descriptors, tables);
     expand_descriptors_inner(
         descriptors,
         tables,
@@ -1122,6 +1143,17 @@ fn expand_replicated_group(
         expand_descriptors_inner(group, tables, state, strict, structural_fixed_replication);
     state.replication_depth -= 1;
     expanded
+}
+
+/// The descriptors that describe a message's data. When Section 3 starts
+/// with a sequence that the embedded DX tables name as a Table A message
+/// type, that sequence alone describes the data and the descriptors after it
+/// restate it, as NCEPLIBS-bufr reads such messages.
+fn message_type_template<'a>(descriptors: &'a [u32], tables: &TableSet) -> &'a [u32] {
+    match descriptors.first() {
+        Some(first) if tables.message_types.contains(first) => &descriptors[..1],
+        _ => descriptors,
+    }
 }
 
 fn expand_descriptors_inner(

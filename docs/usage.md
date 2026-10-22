@@ -277,6 +277,11 @@ or replication descriptor (at open time under `strict=True`, otherwise at the
 first message that uses it). Expansion stops after 100,000 inlined sequences or
 64 nested replications.
 
+When Section 3 starts with a sequence that the embedded DX tables name as a
+Table A message type, that sequence alone describes the data, as NCEPLIBS-bufr
+reads it; the descriptors after it restate the sequence and are not decoded
+again. NCEP GOES radiance dumps (`gsrcsr`, `gsrasr`) carry such a Section 3.
+
 `skip_truncated_messages` skips messages whose template extends past their
 Section 4 payload and decodes the rest; the iterator's `decode_failures` lists
 what was skipped. Without it, a truncated message raises under `strict=True` and
