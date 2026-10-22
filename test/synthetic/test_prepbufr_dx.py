@@ -28,6 +28,7 @@ from .builders import (
     LEGACY_MISSING_STRING,
     build_embedded_code_flag_operator_message,
     build_ia5_missing_prepbufr,
+    build_restated_message_type_messages,
     build_self_referencing_sequence_messages,
     build_two_epoch_prepbufr_messages,
     synthetic_prepbufr_dx_case,
@@ -287,3 +288,21 @@ def test_embedded_dx_code_flag_descriptors_are_exempt_from_numeric_operators(tmp
     assert table["LOC_CODE"].tolist() == [5.0]
     assert table["LOC_FLAG"].tolist() == [3.0]
     assert table["LOC_NUM"].tolist() == [pytest.approx(12.3)]
+
+
+def test_section3_led_by_a_table_a_message_type_decodes_that_sequence(tmp_path: Path):
+    """Section 3 that starts with a DX Table A message type describes the data with that sequence alone;
+    the descriptors after it restate the sequence, as NCEPLIBS-bufr reads such messages."""
+    import pyarrow as pa
+
+    import earth2bufr
+
+    path = tmp_path / "restated.bufr"
+    path.write_bytes(build_restated_message_type_messages())
+
+    with earth2bufr.open_bufr(path, strict=True) as source:
+        table = pa.Table.from_batches(list(source.iter_batches()))
+
+    assert [name for name in table.column_names if not name.startswith("_")] == ["SID", "TOB"]
+    assert table.column("SID").to_pylist() == ["KDEN"]
+    assert table.column("TOB").to_pylist() == [pytest.approx(273.1)]

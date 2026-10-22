@@ -28,15 +28,20 @@ if TYPE_CHECKING:
 from . import adapters
 from .assertions import assert_nested_rows_match, assert_reference_frames_match
 from .builders import (
+    BITMAP_MARKER_KEYS,
+    bitmap_marker_value,
+    build_bitmap_marker_message,
     build_code_flag_combined_operator_message,
     build_code_flag_operator_message,
     build_quality_bitmap_message,
+    build_quality_section_message,
     code_flag_combined_operator_case,
     code_flag_operator_case,
     compressed_numeric_case,
     delayed_replication_case,
     edition3_surface_case,
     missing_value_case,
+    quality_section_values,
     surface_observation_case,
 )
 
@@ -147,6 +152,84 @@ def test_wmo_quality_bitmap_operators_match_eccodes(tmp_path: Path):
         ("B033007", 70.0),
         ("B033007", 90.0),
         ("B011002", 3.5),
+    ]
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["uncompressed", "compressed"])
+@pytest.mark.parametrize("operator", sorted(BITMAP_MARKER_KEYS), ids=lambda operator: f"2-{operator:02d}-255")
+def test_wmo_bitmap_marker_operators_match_eccodes(tmp_path: Path, operator: int, compressed: bool):
+    """Marker operators with YYY=255 read the element the bitmap points at, as ecCodes does."""
+    import earth2bufr
+
+    path = tmp_path / "bitmap_marker.bufr"
+    path.write_bytes(build_bitmap_marker_message(operator, compressed=compressed, num_subsets=2, passes=2))
+    key = BITMAP_MARKER_KEYS[operator]
+    reference = _decode_reference("ecCodes", adapters.decode_eccodes_keys, path, [key])[key]
+    expected = [
+        [bitmap_marker_value(operator, subset, repeat, marker) for repeat in range(2) for marker in range(2)]
+        for subset in range(2)
+    ]
+    # ecCodes lists uncompressed values subset by subset and compressed values marker by marker.
+    if compressed:
+        reference_rows = [reference[subset::2] for subset in range(2)]
+    else:
+        reference_rows = [reference[subset * 4 : (subset + 1) * 4] for subset in range(2)]
+    batch = next(iter(earth2bufr.read_bufr(path)))
+    suffix = f"_2{operator:02d}255"
+    markers = [name for name in batch.schema.names if name.endswith(suffix)]
+    rows = [
+        [batch.column(index)[subset].as_py() for index, name in enumerate(batch.schema.names) if name in markers]
+        for subset in range(2)
+    ]
+
+    assert reference_rows == [pytest.approx(row) for row in expected]
+    assert markers == [f"B012101{suffix}", f"B011002{suffix}"] * 2
+    assert rows == [pytest.approx(row) for row in expected]
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["uncompressed", "compressed"])
+def test_wmo_quality_section_with_bitmap_reuse_matches_eccodes(tmp_path: Path, compressed: bool):
+    """Confidences, reused-bitmap statistics and a substituted value on a second bitmap match ecCodes,
+    in strict mode and in both fixed replication layouts."""
+    import pyarrow as pa
+
+    import earth2bufr
+
+    path = tmp_path / "quality_section.bufr"
+    path.write_bytes(build_quality_section_message(compressed=compressed))
+    expected = [quality_section_values(subset) for subset in range(2)]
+    targets = ["#1#airTemperature", "#2#airTemperature", "#2#windSpeed"]
+    keys = {
+        "percentConfidence": [f"{target}->percentConfidence" for target in targets],
+        "firstOrderStatisticalValue": [f"{target}->firstOrderStatisticalValue" for target in targets],
+        "substitutedValue": ["#1#year->substitutedValue"],
+    }
+    reference = _decode_reference(
+        "ecCodes", adapters.decode_eccodes_keys, path, [key for group in keys.values() for key in group]
+    )
+    # ecCodes attaches these values to their elements in the first subset only when uncompressed.
+    for subset in range(2 if compressed else 1):
+        for name, group in keys.items():
+            assert [reference[key][subset] for key in group] == pytest.approx(expected[subset][name]), name
+
+    suffixes = {"firstOrderStatisticalValue": "_224255", "substitutedValue": "_223255"}
+    marker_names = {
+        "flat": ["B012101_224255", "B012101_224255", "B011002_224255", "B004001_223255"],
+        "structural": ["B012101_224255", "B012101_224255", "B011002_224255", "B004001_223255"],
+    }
+    for layout, names in marker_names.items():
+        with earth2bufr.open_bufr(path, strict=True) as source:
+            batch = pa.Table.from_batches(list(source.iter_batches(fixed_replication=layout)))
+        markers = [name for name in batch.column_names if name.endswith(tuple(suffixes.values()))]
+        assert markers == names, layout
+        for key, suffix in suffixes.items():
+            columns = [batch.column(i) for i, name in enumerate(batch.column_names) if name.endswith(suffix)]
+            rows = [[column[subset].as_py() for column in columns] for subset in range(2)]
+            assert rows == [pytest.approx(row[key]) for row in expected], (layout, key)
+    flat = pa.Table.from_batches(earth2bufr.read_bufr(path, strict=True))
+    confidences = [flat.column(i) for i, name in enumerate(flat.column_names) if name == "B033007"]
+    assert [[column[subset].as_py() for column in confidences] for subset in range(2)] == [
+        row["percentConfidence"] for row in expected
     ]
 
 
