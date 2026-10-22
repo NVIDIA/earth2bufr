@@ -263,12 +263,8 @@ with earth2bufr.open_bufr(path, strict=True) as source:
 Operators the decoder does not apply fail in both modes when they read Section 4
 bits or change the widths of later elements: `2-03-YYY` reference value
 definitions (YYY > 0) and `2-03-255`, `2-08`, `2-09`, `2-21`, and any other
-operator outside the lists below. Permissive decoding skips `2-22-000` to
-`2-25-000`, `2-32-000`, `2-35-000`, `2-36-000`, `2-37-000`, `2-37-255`,
-`2-41-000`, `2-41-255`, `2-42-000` and `2-42-255`, which occupy no bits; the
-bitmaps and values they announce decode as ordinary columns. Strict decoding
-rejects them. `2-03-000` (end of reference value changes) and `2-05-000` (zero
-characters) occupy no bits and decode in both modes.
+operator outside the lists below. `2-03-000` (end of reference value changes)
+and `2-05-000` (zero characters) occupy no bits and decode in both modes.
 
 A Table D sequence that contains itself, directly or inside a replicated group,
 is a malformed table: it raises `ValueError` in both modes, naming the sequence
@@ -276,17 +272,31 @@ or replication descriptor (at open time under `strict=True`, otherwise at the
 first message that uses it). Expansion stops after 100,000 inlined sequences or
 64 nested replications.
 
-The `2-23-255`, `2-24-255`, `2-25-255` and `2-32-255` markers each carry one
-value of the next element that a data-present bitmap (`2-36-000` followed by
-`0-31-031` indicators) marks present, packed like that element (`2-25-255`
-carries a difference one bit wider). Permissive decoding reads them as columns
-named after the element and the marker, such as `B012063_224255`; strict decoding
-rejects the bitmap operator that defines their bitmap.
-`2-37-000` restarts the bitmap and `2-35-000` or `2-37-255` cancels it. A
-marker needs one bitmap for the whole batch, read from the first subset: decoding
-fails if later subsets or messages in the batch mark other elements present, if
-no bitmap is defined before the marker, or if the bitmap or marker lies inside a
-replication.
+The quality operators decode in both modes: `2-22-000`, `2-23-000`, `2-24-000`,
+`2-25-000` and `2-32-000` ("values follow"), `2-35-000`, `2-36-000`, `2-37-000`
+and `2-37-255` occupy no bits, and the data-present bitmaps (`0-31-031`) and
+class 33 values they announce decode as ordinary columns. A bitmap follows a
+"values follow" operator directly, or follows `2-36-000`, which defines it for
+reuse; `2-37-000` reuses it and `2-37-255` ends the reuse. Strict decoding
+rejects a `2-37-000` with no `2-36-000` bitmap before it. Permissive decoding
+skips the event operators `2-41-000`, `2-41-255`, `2-42-000` and `2-42-255`,
+which occupy no bits; strict decoding rejects them.
+
+A bitmap refers to the elements before the first "values follow" or
+`2-36-000` operator, counted back over the expanded template; later bitmaps
+refer to the same elements until `2-35-000` cancels the backward reference
+(WMO-No. 306 Table C, as ecCodes and PyBufrKit apply it). The `2-23-255`,
+`2-24-255`, `2-25-255` and `2-32-255` markers each carry one value of the next
+element their bitmap marks present, packed like that element (`2-25-255`
+carries a difference one bit wider, from a reference value of -2^width). They
+decode as columns named after the element and the marker, such as
+`B012063_224255`; inside a fixed replication each repetition gets its own
+columns in both layouts. A marker needs one bitmap for the whole batch, read
+from the first subset: decoding fails if later subsets or messages mark other
+elements present, if no bitmap is defined before the marker, if the bitmap lies
+inside a replication or refers back over a delayed replication, if the marker
+lies inside a delayed replication, or if an associated field (`2-04-YYY`) is
+defined before it.
 
 When Section 3 starts with a sequence that the embedded DX tables name as a
 Table A message type, that sequence alone describes the data, as NCEPLIBS-bufr

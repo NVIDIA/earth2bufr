@@ -956,6 +956,13 @@ def build_bitmap_marker_message(
                 row.append((bitmap_marker_raw(subset, repeat, index), field.bit_width + extra))
         rows.append(row)
 
+    return bufr_message(
+        descriptors, _raw_rows_section4(rows, compressed), num_subsets=num_subsets, compressed=compressed
+    )
+
+
+def _raw_rows_section4(rows: Sequence[Sequence[tuple[int, int]]], compressed: bool) -> bytes:
+    """Pack one (raw code, width) list per subset, compressed column by column or subset by subset."""
     writer = BitWriter()
     if compressed:
         for column in zip(*rows, strict=True):
@@ -971,7 +978,88 @@ def build_bitmap_marker_message(
         for row in rows:
             for raw, width in row:
                 writer.write_bits(raw, width)
-    return bufr_message(descriptors, writer.to_bytes(), num_subsets=num_subsets, compressed=compressed)
+    return writer.to_bytes()
+
+
+FIRST_ORDER_STATISTICS = WmoField(
+    "first_order_statistics", 0, 8, 23, "B008023", "firstOrderStatistics", 0, 0, 6, "CODE TABLE"
+)
+# The elements a quality section refers back to: year, then two (air temperature, wind speed) pairs.
+QUALITY_ELEMENTS = (YEAR, AIR_TEMPERATURE, WIND_SPEED, AIR_TEMPERATURE, WIND_SPEED)
+QUALITY_BITMAP = (1, 0, 1, 0, 0)
+SUBSTITUTED_BITMAP = (0, 1, 1, 1, 1)
+QUALITY_STATISTIC_RAWS = (100, 200, 30)
+
+
+def quality_section_values(subset: int) -> dict[str, list[float]]:
+    """Return the confidences, statistics and substituted value of ``subset``.
+
+    Subsets differ by two codes, so no compressed increment is all ones, which would mean missing.
+    """
+    present = [field for field, bit in zip(QUALITY_ELEMENTS, QUALITY_BITMAP, strict=True) if bit == 0]
+    return {
+        "percentConfidence": [50.0 + 10 * index + 2 * subset for index in range(len(present))],
+        "firstOrderStatisticalValue": [
+            (raw + 2 * subset) / 10**field.scale for raw, field in zip(QUALITY_STATISTIC_RAWS, present, strict=True)
+        ],
+        "substitutedValue": [2030.0 + 2 * subset],
+    }
+
+
+def build_quality_section_message(*, compressed: bool = False, num_subsets: int = 2) -> bytes:
+    """Build values, then a quality section shaped like NESDIS GOES radiance messages.
+
+    2-22-000 and 2-36-000 define a bitmap over the five values and give a confidence for each one it
+    marks present; 2-24-000 and 2-37-000 reuse that bitmap for 2-24-255 statistics inside a fixed
+    replication; 2-23-000 then defines a new bitmap, which refers back to the same five values, for
+    one 2-23-255 substituted value.
+    """
+    descriptors = [
+        YEAR.descriptor,
+        desc(1, 2, 2),
+        AIR_TEMPERATURE.descriptor,
+        WIND_SPEED.descriptor,
+        desc(2, 22, 0),
+        desc(2, 36, 0),
+        desc(1, 1, len(QUALITY_ELEMENTS)),
+        desc(0, 31, 31),
+        desc(1, 1, 3),
+        PERCENT_CONFIDENCE.descriptor,
+        desc(2, 24, 0),
+        desc(2, 37, 0),
+        FIRST_ORDER_STATISTICS.descriptor,
+        desc(1, 1, 3),
+        desc(2, 24, 255),
+        desc(2, 23, 0),
+        desc(1, 1, len(QUALITY_ELEMENTS)),
+        desc(0, 31, 31),
+        desc(2, 23, 255),
+    ]
+    elements = (2024, 281.5, 3.5, 290.25, 7.5)
+    present = [field for field, bit in zip(QUALITY_ELEMENTS, QUALITY_BITMAP, strict=True) if bit == 0]
+    rows = []
+    for subset in range(num_subsets):
+        values = quality_section_values(subset)
+        rows.append(
+            [
+                *[
+                    (field.encode_raw(value + 2 * subset), field.bit_width)
+                    for field, value in zip(QUALITY_ELEMENTS, elements, strict=True)
+                ],
+                *[(bit, 1) for bit in QUALITY_BITMAP],
+                *[(round(value), PERCENT_CONFIDENCE.bit_width) for value in values["percentConfidence"]],
+                (10, FIRST_ORDER_STATISTICS.bit_width),
+                *[
+                    (raw + 2 * subset, field.bit_width)
+                    for raw, field in zip(QUALITY_STATISTIC_RAWS, present, strict=True)
+                ],
+                *[(bit, 1) for bit in SUBSTITUTED_BITMAP],
+                (YEAR.encode_raw(values["substitutedValue"][0]), YEAR.bit_width),
+            ]
+        )
+    return bufr_message(
+        descriptors, _raw_rows_section4(rows, compressed), num_subsets=num_subsets, compressed=compressed
+    )
 
 
 def _write_compressed_numeric_values(writer: BitWriter, field: WmoField, values: Sequence[Any]) -> None:

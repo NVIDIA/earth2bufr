@@ -1535,7 +1535,19 @@ NO_DATA_OPERATORS = [
     (2, 42, 0),
     (2, 42, 255),
 ]
-STRICT_NO_DATA_OPERATORS = [(2, 3, 0), (2, 5, 0)]
+# 2-37-000 without a 2-36-000 bitmap before it is not a valid use, so strict decoding rejects it.
+STRICT_NO_DATA_OPERATORS = [
+    (2, 3, 0),
+    (2, 5, 0),
+    (2, 22, 0),
+    (2, 23, 0),
+    (2, 24, 0),
+    (2, 25, 0),
+    (2, 32, 0),
+    (2, 35, 0),
+    (2, 36, 0),
+    (2, 37, 255),
+]
 
 
 @pytest.mark.rust
@@ -1555,8 +1567,8 @@ def test_permissive_decode_rejects_operators_that_change_the_bit_layout(tmp_path
 @pytest.mark.rust
 @pytest.mark.parametrize("operator", NO_DATA_OPERATORS, ids=lambda operator: desc_name(*operator))
 def test_operators_without_data_bits_decode_permissively_and_fail_strict(tmp_path: Path, operator):
-    """Values after an operator that occupies no bits stay aligned; strict mode rejects it unless it is
-    2-03-000 or 2-05-000."""
+    """Values after an operator that occupies no bits stay aligned; strict mode rejects the event
+    operators and a 2-37-000 with no bitmap to reuse."""
     import earth2bufr
 
     path = _write_messages(tmp_path, "operator.bufr", [_operator_message(operator)])
@@ -1568,7 +1580,7 @@ def test_operators_without_data_bits_decode_permissively_and_fail_strict(tmp_pat
         with earth2bufr.open_bufr(path, strict=True) as source:
             assert next(source.iter_batches()).equals(batch)
     else:
-        with pytest.raises(ValueError, match=f"Unsupported operator {desc_name(*operator)}"):
+        with pytest.raises(ValueError, match=f"(Unsupported|Invalid) operator {desc_name(*operator)}"):
             earth2bufr.open_bufr(path, strict=True)
 
 
