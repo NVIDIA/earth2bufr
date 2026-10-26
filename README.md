@@ -1,5 +1,7 @@
 # earth2bufr
 
+![Maturity: L1 Emerging](https://img.shields.io/badge/Maturity-L1%20Emerging-A4C639?style=flat-square) ![License](https://img.shields.io/badge/License-Apache%202.0-green?style=flat-square)
+
 Rust-based BUFR (Binary Universal Form for the Representation of meteorological data)
 file parser with Python bindings focused entirely on decoding BUFR messages into
 in-memory PyArrow tables for ETL and analysis.
