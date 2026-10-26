@@ -37,7 +37,8 @@ columns. Assertion failures include the fixture descriptor list and expected row
 | `wmo_bitmap_marker_operators` | `2-23-255`, `2-24-255`, `2-25-255` and `2-32-255` markers after a `2-36-000` bitmap, uncompressed and compressed, two subsets, bitmap reused with `2-37-000` | ecCodes | Marker values come from the element the bitmap points at, with its width, scale and reference value |
 | `wmo_quality_section_with_bitmap_reuse` | GOES-shaped quality section: `2-22-000`/`2-36-000` confidences, `2-24-000`/`2-37-000` statistics through `2-24-255` inside a fixed replication, then a `2-23-000` bitmap for a `2-23-255` value; uncompressed and compressed | ecCodes | Later bitmaps refer back to the same elements; markers inside a replication decode per repetition in the flat and structural layouts |
 
-The code/flag operator fixtures use ecCodes only; PyBufrKit 0.2.25 compares code/flag units case-sensitively against its bundled tables.
+The code/flag operator fixtures use ecCodes only; PyBufrKit 0.2.25 compares code/flag units case-sensitively
+against its bundled tables.
 
 The delayed-replication flattening test is marked `xfail` because it documents
 the desired generic DataFrame shape: one flattened row per replicated level. It
