@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # Validation Suite
 
 Earth2bufr validation is intentionally small, real, and readable. The tests

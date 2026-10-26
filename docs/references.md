@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # BUFR Format Reference
 
 This page provides reference information for the BUFR (Binary Universal Form
