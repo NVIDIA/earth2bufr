@@ -211,4 +211,3 @@ uv run python test/_license/header_check.py
         maintained indefinitely and may be redistributed consistent with
         this project or the open source license(s) involved.
   ```
-
