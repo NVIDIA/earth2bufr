@@ -4153,7 +4153,7 @@ fn parallel_concat_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch, Str
 
 /// Least encoded message bytes per chunk when uncompressed messages are
 /// decoded in parallel; each chunk has its own builders and is concatenated.
-const MIN_UNCOMPRESSED_CHUNK_BYTES: usize = 1 << 20;
+const MIN_UNCOMPRESSED_CHUNK_BYTES: usize = 128 << 10;
 
 /// Decode uncompressed messages in parallel, returning a single RecordBatch.
 /// Splits messages into at most one chunk per thread, each with at least
