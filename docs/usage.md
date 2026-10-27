@@ -149,12 +149,13 @@ earth2bufr.get_num_threads()   # 16
 
 Decoding runs on its own thread pool. Without a `set_num_threads` call, its size
 is taken from `EARTH2BUFR_NUM_THREADS`, then `RAYON_NUM_THREADS`, then the number
-of CPUs available to the process. A new size applies from the next batch; with
-one thread, decoding runs on the calling thread.
+of CPUs available to the process, at most 32. A new size applies from the next
+batch; with one thread, decoding runs on the calling thread.
 
-On multi-socket machines, a thread count of about one socket's cores is usually
-fastest: on a 2 x 56-core node, 56 threads decoded about twice as fast as all
-224 logical CPUs and used less memory.
+On a 2 x 56-core node, every measured NNJA file (AMSU-A to CrIS) decoded fastest
+at 16 to 56 threads, and 1.8 to 3 times slower on all 224 logical CPUs. Large
+compressed files such as CrIS and IASI can gain from up to one socket's cores
+(`set_num_threads(56)`).
 
 ## Channel Structure: `flat` vs `structural`
 

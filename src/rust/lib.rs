@@ -7232,8 +7232,13 @@ fn forget_inherited(pool: DecodePool) -> usize {
     threads
 }
 
+/// Largest thread count taken from the available parallelism; the environment
+/// variables and `set_num_threads` may set more.
+const MAX_DEFAULT_THREADS: usize = 32;
+
 /// Thread count from `EARTH2BUFR_NUM_THREADS`, else `RAYON_NUM_THREADS`, else the
-/// available parallelism. Unset, unparsable and zero values are skipped.
+/// available parallelism up to `MAX_DEFAULT_THREADS`. Unset, unparsable and
+/// zero values are skipped.
 fn default_num_threads() -> usize {
     ["EARTH2BUFR_NUM_THREADS", "RAYON_NUM_THREADS"]
         .iter()
@@ -7243,7 +7248,11 @@ fn default_num_threads() -> usize {
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .filter(|&threads| threads > 0)
         })
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, NonZeroUsize::get)
+                .min(MAX_DEFAULT_THREADS)
+        })
 }
 
 fn build_decode_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, String> {

@@ -787,8 +787,8 @@ def get_num_threads() -> int:
 
     Before any :func:`set_num_threads` call this is ``EARTH2BUFR_NUM_THREADS``,
     else ``RAYON_NUM_THREADS``, else the number of CPUs available to the
-    process, read when the first decode or this call builds the pool. Unset,
-    non-integer and zero values are skipped.
+    process up to 32, read when the first decode or this call builds the pool.
+    Unset, non-integer and zero values are skipped.
 
     Returns
     -------

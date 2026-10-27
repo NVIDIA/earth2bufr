@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Use at most 32 decode threads by default; `EARTH2BUFR_NUM_THREADS`,
+  `RAYON_NUM_THREADS` and `set_num_threads` still set any count
+
 ### Deprecated
 
 ### Removed
