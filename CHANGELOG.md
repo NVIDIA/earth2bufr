@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- NCEP subset framing is no longer output: the `BYTCNT` subset byte count, the
+  `0-63-255` bit padding and delayed replications holding only padding
+  (`DRF8BIT` in GPS-RO and PrepBUFR) are read and checked but are not columns
+
 ### Deprecated
 
 ### Removed

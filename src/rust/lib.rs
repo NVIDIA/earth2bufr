@@ -4551,6 +4551,235 @@ impl Projection {
     }
 }
 
+/// NCEP bit padding to the next byte boundary, written as `2-06-YYY 0-63-255`.
+const NCEP_PAD_DESCRIPTOR: u32 = 63 << 8 | 255;
+
+/// A schema whose items name the decoded fields and nest like the template.
+trait SchemaNode: Sized {
+    fn node_name(&self) -> &str;
+    fn node_children(&self) -> &[Self];
+}
+
+impl SchemaNode for SchemaItem {
+    fn node_name(&self) -> &str {
+        schema_item_name(self)
+    }
+
+    fn node_children(&self) -> &[Self] {
+        match self {
+            Self::Scalar { .. } => &[],
+            Self::ReplicationGroup { children, .. } => children,
+        }
+    }
+}
+
+impl SchemaNode for StructuralSchemaItem {
+    fn node_name(&self) -> &str {
+        self.name()
+    }
+
+    fn node_children(&self) -> &[Self] {
+        match self {
+            Self::Scalar { .. } => &[],
+            Self::Replication { children, .. } => children,
+        }
+    }
+}
+
+/// One schema item and whether it is NCEP subset framing: the leading BYTCNT,
+/// a 0-63-255 pad, or a group that holds only framing. Framing is read and
+/// checked like any field but is not output.
+struct OutputNode<'a> {
+    name: &'a str,
+    framing: bool,
+    children: Vec<OutputNode<'a>>,
+}
+
+impl OutputNode<'_> {
+    fn holds_framing(&self) -> bool {
+        self.framing || self.children.iter().any(OutputNode::holds_framing)
+    }
+}
+
+/// One node per item of `schema`, the schema derived from `expanded`.
+fn output_nodes<'a, S: SchemaNode>(
+    expanded: &[ExpandedItem],
+    schema: &'a [S],
+    leading_byte_count: bool,
+) -> Vec<OutputNode<'a>> {
+    let mut schema = schema.iter();
+    let mut nodes = Vec::new();
+    for (index, item) in expanded.iter().enumerate() {
+        if is_zero_width(item) {
+            continue;
+        }
+        let Some(field) = schema.next() else {
+            break;
+        };
+        let node = match item {
+            ExpandedItem::Descriptor(descriptor, _) => OutputNode {
+                name: field.node_name(),
+                framing: *descriptor == NCEP_PAD_DESCRIPTOR || (leading_byte_count && index == 0),
+                children: Vec::new(),
+            },
+            ExpandedItem::FixedReplication { group, .. }
+            | ExpandedItem::DelayedReplication { group, .. } => {
+                let children = output_nodes(group, field.node_children(), false);
+                OutputNode {
+                    name: field.node_name(),
+                    framing: !children.is_empty() && children.iter().all(|child| child.framing),
+                    children,
+                }
+            }
+        };
+        nodes.push(node);
+    }
+    nodes
+}
+
+fn template_output_nodes<'a, S: SchemaNode>(
+    expanded: &[ExpandedItem],
+    schema: &'a [S],
+) -> Vec<OutputNode<'a>> {
+    output_nodes(
+        expanded,
+        schema,
+        ncep_subset_byte_count_entry(expanded).is_some(),
+    )
+}
+
+/// Whether `path` reaches only framing fields.
+fn names_framing(nodes: &[OutputNode<'_>], path: &str) -> bool {
+    let mut level: Vec<&OutputNode<'_>> = nodes.iter().collect();
+    for part in path.split('.') {
+        let matched: Vec<&OutputNode<'_>> =
+            level.into_iter().filter(|node| node.name == part).collect();
+        if matched.is_empty() {
+            return false;
+        }
+        if matched.iter().all(|node| node.framing) {
+            return true;
+        }
+        level = matched.iter().flat_map(|node| &node.children).collect();
+    }
+    false
+}
+
+fn resolve_output_path<'n, 'a>(nodes: &'n [OutputNode<'a>], path: &str) -> Vec<&'n OutputNode<'a>> {
+    let mut matched = Vec::new();
+    let mut level: Vec<&OutputNode<'a>> = nodes.iter().collect();
+    for part in path.split('.') {
+        matched = level.into_iter().filter(|node| node.name == part).collect();
+        level = matched.iter().flat_map(|node| &node.children).collect();
+    }
+    matched
+}
+
+/// Push `path`, whose fields are `matched`, or, when they hold framing and
+/// the layout allows a deeper path, the paths of their other children.
+fn push_framing_free_paths(
+    matched: &[&OutputNode<'_>],
+    path: String,
+    depth: usize,
+    max_depth: usize,
+    paths: &mut Vec<String>,
+) {
+    if depth >= max_depth || !matched.iter().any(|node| node.holds_framing()) {
+        paths.push(path);
+        return;
+    }
+    let children: Vec<&OutputNode<'_>> = matched
+        .iter()
+        .filter(|node| !node.framing)
+        .flat_map(|node| &node.children)
+        .collect();
+    let mut seen = HashSet::new();
+    for child in &children {
+        if !seen.insert(child.name) {
+            continue;
+        }
+        let named: Vec<&OutputNode<'_>> = children
+            .iter()
+            .copied()
+            .filter(|node| node.name == child.name)
+            .collect();
+        if named.iter().all(|node| node.framing) {
+            continue;
+        }
+        push_framing_free_paths(
+            &named,
+            format!("{path}.{}", child.name),
+            depth + 1,
+            max_depth,
+            paths,
+        );
+    }
+}
+
+/// The projection that leaves framing out of a decode: the requested paths,
+/// or every field, with framing removed and each group that holds framing
+/// narrowed to its other children. `None` when the template has no framing.
+/// A projection or raw-code path that names framing is not found.
+fn framing_free_projection(
+    nodes: &[OutputNode<'_>],
+    requested: Option<&Projection>,
+    raw_code_paths: Option<&[String]>,
+    layout: FixedReplicationLayout,
+) -> Result<Option<Projection>, String> {
+    if !nodes.iter().any(OutputNode::holds_framing) {
+        return Ok(None);
+    }
+    let requested_paths = requested.map(|projection| projection.paths.as_slice());
+    for (option, paths) in [
+        ("Projection", requested_paths),
+        ("Raw-code", raw_code_paths),
+    ] {
+        let framing: Vec<&String> = paths
+            .into_iter()
+            .flatten()
+            .filter(|path| names_framing(nodes, path))
+            .collect();
+        if !framing.is_empty() {
+            return Err(format!("{option} fields not found: {framing:?}"));
+        }
+    }
+    let max_depth = match layout {
+        FixedReplicationLayout::Flat => 2,
+        FixedReplicationLayout::Structural => usize::MAX,
+    };
+    let mut paths = Vec::new();
+    match requested_paths {
+        Some([]) => return Ok(None),
+        Some(requested) => {
+            for path in requested {
+                let matched = resolve_output_path(nodes, path);
+                let depth = path.split('.').count();
+                push_framing_free_paths(&matched, path.clone(), depth, max_depth, &mut paths);
+            }
+        }
+        None => {
+            let mut seen = HashSet::new();
+            for node in nodes {
+                if APPENDED_COLUMNS.contains(&node.name)
+                    || !seen.insert(node.name)
+                    || names_framing(nodes, node.name)
+                {
+                    continue;
+                }
+                let named: Vec<&OutputNode<'_>> = nodes
+                    .iter()
+                    .filter(|other| other.name == node.name)
+                    .collect();
+                push_framing_free_paths(&named, node.name.to_string(), 1, max_depth, &mut paths);
+            }
+        }
+    }
+    Ok(Some(Projection {
+        tree: parse_projection_tree(&paths, layout)?,
+        paths,
+    }))
+}
+
 /// Project selected children from a `List<Struct<...>>` without materializing
 /// Python objects or changing list offsets.
 fn project_list_struct_children(
@@ -6754,20 +6983,29 @@ fn decode_structural_bounded_group(
         Some(&group.messages),
     )?;
     let mut schema = derive_structural_schema(&expanded, None);
+    let nodes = template_output_nodes(&expanded, &schema);
     let present;
     let options = if options.projection_missing == ProjectionMissing::Skip {
         present = options.present_fields(|path| {
             find_structural_item(&schema, &path.split('.').collect::<Vec<_>>()).is_some()
+                && !names_framing(&nodes, path)
         })?;
         options.with_fields(&present)
     } else {
         options
     };
+    let framing_free = framing_free_projection(
+        &nodes,
+        options.projection,
+        options.raw_code_paths,
+        FixedReplicationLayout::Structural,
+    )?;
+    let projection = framing_free.as_ref().or(options.projection);
     apply_structural_raw_code_paths(&mut schema, options.raw_code_paths)?;
-    if let Some(projection) = options.projection {
+    if let Some(projection) = projection {
         validate_structural_paths(&schema, &projection.paths, "Projection")?;
     }
-    let selection = options.projection.map(|projection| &projection.tree);
+    let selection = projection.map(|projection| &projection.tree);
     if group.template.is_compressed {
         let fields = schema
             .iter()
@@ -6793,7 +7031,7 @@ fn decode_structural_bounded_group(
         return append_source_provenance(batch, group.indices, &group.subset_counts);
     }
     let flat_raw_paths = structural_raw_paths_for_flat_decode(&schema, options.raw_code_paths)?;
-    let flat = decode_bounded_group(
+    let flat = decode_flat_bounded_group(
         group,
         BoundedDecodeOptions {
             projection: None,
@@ -6803,6 +7041,7 @@ fn decode_structural_bounded_group(
             fixed_replication: FixedReplicationLayout::Flat,
             projection_missing: ProjectionMissing::Raise,
         },
+        false,
     )?;
     restack_flat_batch_structurally(flat, &schema, selection)
 }
@@ -6833,10 +7072,19 @@ fn decode_bounded_group(
     group: &MessageGroup<'_>,
     options: BoundedDecodeOptions<'_>,
 ) -> Result<RecordBatch, String> {
-    if options.fixed_replication == FixedReplicationLayout::Structural {
-        return decode_structural_bounded_group(group, options);
+    match options.fixed_replication {
+        FixedReplicationLayout::Flat => decode_flat_bounded_group(group, options, true),
+        FixedReplicationLayout::Structural => decode_structural_bounded_group(group, options),
     }
+}
 
+/// Decode one bounded group in the flat layout; framing fields are output
+/// only when `drop_framing` is false, as the structural restack needs them.
+fn decode_flat_bounded_group(
+    group: &MessageGroup<'_>,
+    options: BoundedDecodeOptions<'_>,
+    drop_framing: bool,
+) -> Result<RecordBatch, String> {
     let template = group.template;
     let mut expanded = expand_descriptors(
         &template.descriptors,
@@ -6847,9 +7095,12 @@ fn decode_bounded_group(
     )?;
     append_data_category(&mut expanded);
     let mut schema = derive_schema(&expanded);
+    let nodes = template_output_nodes(&expanded, &schema);
     let present;
     let options = if options.projection_missing == ProjectionMissing::Skip {
-        present = options.present_fields(|path| flat_path_present(&schema, path))?;
+        present = options.present_fields(|path| {
+            flat_path_present(&schema, path) && !names_framing(&nodes, path)
+        })?;
         options.with_fields(&present)
     } else {
         options
@@ -6861,6 +7112,17 @@ fn decode_bounded_group(
         policy,
         ..
     } = options;
+    let framing_free = if drop_framing {
+        framing_free_projection(
+            &nodes,
+            projection,
+            raw_code_paths,
+            FixedReplicationLayout::Flat,
+        )?
+    } else {
+        None
+    };
+    let projection = framing_free.as_ref().or(projection);
     apply_raw_code_paths(&expanded, &mut schema, raw_code_paths)?;
     let batch = if template.is_compressed {
         let (mut fields, arrays) = compressed_messages_to_columns(
@@ -7136,17 +7398,27 @@ fn collect_active_descriptors(
     Ok(())
 }
 
+/// Effective packing of the output fields of `expanded`, whose nodes are
+/// `nodes`.
 fn collect_effective_occurrences(
     expanded: &[ExpandedItem],
+    nodes: &[OutputNode<'_>],
     prefix: Option<&str>,
     occurrences: &mut Vec<Value>,
     mnemonic_counts: &mut HashMap<String, usize>,
 ) {
     let mut replication_names = HashMap::new();
+    let mut nodes = nodes.iter();
     for item in expanded {
+        if is_zero_width(item) {
+            continue;
+        }
+        let Some(node) = nodes.next() else {
+            break;
+        };
         match item {
             ExpandedItem::Descriptor(descriptor, entry) => {
-                if entry.bit_width == 0 {
+                if node.framing {
                     continue;
                 }
                 let mnemonic = entry.mnemonic.to_string();
@@ -7180,6 +7452,9 @@ fn collect_effective_occurrences(
                 group,
             } => {
                 let name = delayed_group_name(&mut replication_names, &factor_entry.mnemonic);
+                if node.framing {
+                    continue;
+                }
                 let path = field_path(prefix, &name);
                 occurrences.push(json!({
                     "descriptor": descriptor_to_string(*factor_desc),
@@ -7192,26 +7467,38 @@ fn collect_effective_occurrences(
                     "source_missing_code": Value::Null,
                     "units": factor_entry.units,
                 }));
-                collect_effective_occurrences(group, Some(&path), occurrences, mnemonic_counts);
+                collect_effective_occurrences(
+                    group,
+                    &node.children,
+                    Some(&path),
+                    occurrences,
+                    mnemonic_counts,
+                );
             }
         }
     }
 }
 
-fn schema_item_payload(item: &SchemaItem) -> Value {
-    match item {
-        SchemaItem::Scalar {
-            name, is_string, ..
-        } => json!({
-            "name": name,
-            "arrow_type": if *is_string { "string" } else { "double" },
-        }),
-        SchemaItem::ReplicationGroup { name, children } => json!({
-            "name": name,
-            "arrow_type": "list<struct>",
-            "children": children.iter().map(schema_item_payload).collect::<Vec<_>>(),
-        }),
-    }
+/// Payloads of the output fields of `schema`, whose nodes are `nodes`.
+fn schema_payloads(schema: &[SchemaItem], nodes: &[OutputNode<'_>]) -> Vec<Value> {
+    schema
+        .iter()
+        .zip(nodes)
+        .filter(|(_, node)| !node.framing)
+        .map(|(item, node)| match item {
+            SchemaItem::Scalar {
+                name, is_string, ..
+            } => json!({
+                "name": name,
+                "arrow_type": if *is_string { "string" } else { "double" },
+            }),
+            SchemaItem::ReplicationGroup { name, children } => json!({
+                "name": name,
+                "arrow_type": "list<struct>",
+                "children": schema_payloads(children, &node.children),
+            }),
+        })
+        .collect()
 }
 
 /// The rayon pool decodes run on and the process that built it. Built on first
@@ -7917,19 +8204,21 @@ impl BufrFileHandle {
             Some(&messages.iter().collect::<Vec<_>>()),
         )
         .map_err(PyValueError::new_err)?;
+        let schema = derive_schema(&expanded);
+        let nodes = template_output_nodes(&expanded, &schema);
         let mut effective_occurrences = Vec::new();
         let mut mnemonic_counts = HashMap::new();
         collect_effective_occurrences(
             &expanded,
+            &nodes,
             None,
             &mut effective_occurrences,
             &mut mnemonic_counts,
         );
-        let decoded_schema = derive_schema(&expanded)
-            .iter()
+        let decoded_schema = schema_payloads(&schema, &nodes)
+            .into_iter()
             .enumerate()
-            .map(|(position, item)| {
-                let mut payload = schema_item_payload(item);
+            .map(|(position, mut payload)| {
                 payload["position"] = json!(position);
                 payload
             })

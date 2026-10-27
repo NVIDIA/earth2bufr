@@ -44,6 +44,7 @@ from synthetic.builders import (
     build_delayed_replication_message,
     build_fixed_replication_operator_message,
     build_flat_wmo_message,
+    build_ncep_padded_messages,
     build_nested_delayed_replication_message,
     build_nested_fixed_replication_message,
     build_synthetic_prepbufr_ia5_message,
@@ -308,6 +309,35 @@ def test_bytcnt_frame_skips_subset_padding(tmp_path: Path):
         batches = list(source.iter_batches())
 
     assert [value for batch in batches for value in _column(batch, "VAL").to_pylist()] == [5, 7]
+
+
+@pytest.mark.rust
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("fixed_replication", ["flat", "structural"])
+def test_ncep_subset_framing_is_not_output(tmp_path: Path, compressed: bool, fixed_replication: str):
+    """BYTCNT and 0-63-255 pads are read but not output, and their DRF8BIT wrapper is no column."""
+    import earth2bufr
+
+    path = _write_messages(tmp_path, "padded.bufr", list(build_ncep_padded_messages([3, 9], compressed=compressed)))
+    names = ["VAL", "_data_category", *PROVENANCE_COLUMNS]
+
+    with earth2bufr.open_bufr(path, strict=True) as source:
+        (batch,) = source.iter_batches(fixed_replication=fixed_replication)
+        assert batch.schema.names == names
+        assert _column(batch, "VAL").to_pylist() == [3, 9]
+        with pytest.raises(ValueError, match="not found"):
+            list(source.iter_batches(fixed_replication=fixed_replication, projection=["VAL", "DRF8BIT"]))
+        (skipped,) = source.iter_batches(
+            fixed_replication=fixed_replication,
+            projection=["VAL", "BYTCNT", "DRF8BIT"],
+            projection_missing="skip",
+        )
+        assert skipped.schema.names == names
+        structure = source.source_structure(1)
+    assert [field["name"] for field in structure["decoded_physical_schema"]] == ["VAL"]
+    assert [occurrence["mnemonic"] for occurrence in structure["effective_occurrences"]] == ["VAL"]
+    (one_shot,) = earth2bufr.read_bufr(path, fixed_replication=fixed_replication)
+    assert one_shot.schema.names == ["VAL", "_data_category"]
 
 
 @pytest.mark.rust

@@ -534,6 +534,54 @@ def build_bytcnt_framed_messages(subsets: Sequence[bytes], *, value_bits: int = 
     return dx_message, data_message
 
 
+def build_ncep_padded_messages(values: Sequence[int], *, compressed: bool) -> tuple[bytes, bytes]:
+    """Build a DX-table message and a data message of 5-bit VAL subsets padded as NCEPLIBS writes them.
+
+    Each subset ends with a DRF8BIT delayed replication of three 1-bit 0-63-255
+    pads, given their width by operator 2-06-001, that fills it to 16 bits.
+    Uncompressed subsets start with a 16-bit BYTCNT frame.
+    """
+    payload = bytearray()
+    payload.append(0)  # Table A entries
+    payload.append(3)  # Table B entries
+    payload += _dx_table_b_entry(0, 63, 0, "BYTCNT", "Subset byte count", "BYTES", 0, 0, 16)
+    payload += _dx_table_b_entry(0, 63, 2, "VAL", "Synthetic value", "NUMERIC", 0, 0, 5)
+    payload += _dx_table_b_entry(0, 31, 1, "DRF8BIT", "Delayed replication factor", "NUMERIC", 0, 0, 8)
+    payload.append(0)  # Table D entries
+    dx_message = bufr_message([], bytes(payload), num_subsets=1, data_category=11)
+
+    padding = [desc(1, 2, 0), desc(0, 31, 1), desc(2, 6, 1), desc(0, 63, 255)]
+    writer = BitWriter()
+    if compressed:
+        reference = min(values)
+        increment_bits = max(value - reference for value in values).bit_length()
+        writer.write_bits(reference, 5)
+        writer.write_bits(increment_bits, 6)
+        for value in values:
+            writer.write_bits(value - reference, increment_bits)
+        writer.write_bits(3, 8)
+        writer.write_bits(0, 6)
+        for _ in range(3):
+            writer.write_bits(0, 1)
+            writer.write_bits(0, 6)
+        descriptors = [desc(0, 63, 2), *padding]
+    else:
+        for value in values:
+            writer.write_bits(4, 16)
+            writer.write_bits(value, 5)
+            writer.write_bits(3, 8)
+            writer.write_bits(0, 3)
+        descriptors = [desc(0, 63, 0), desc(0, 63, 2), *padding]
+    data_message = bufr_message(
+        descriptors,
+        writer.to_bytes(),
+        num_subsets=len(values),
+        data_category=102,
+        compressed=compressed,
+    )
+    return dx_message, data_message
+
+
 def build_restated_message_type_messages() -> bytes:
     """Build a DX table whose Table A names SYNOBS, then a data message whose Section 3 lists SYNOBS
     followed by its own members again, as NCEP GOES radiance dumps do. The data holds SYNOBS once."""

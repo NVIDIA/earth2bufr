@@ -379,6 +379,13 @@ Columns follow the descriptor template in order:
   `FixedSizeList<Struct>` column named `fixed_F_XX_YYY__occ_N`, where F-XX-YYY
   is the replication descriptor and N counts, from 0, the earlier fixed
   replications with the same descriptor at the same nesting level.
+- NCEP subset framing is read and checked but is not output: the `BYTCNT`
+  (0-63-000) byte count that starts each NCEP subset and the 0-63-255 bit
+  padding (`2-06-YYY 0-63-255`) that ends it. A delayed replication holding only
+  padding, such as `DRF8BIT` in GPS-RO and PrepBUFR, has no column; later
+  replications with the same factor keep their suffix (PrepBUFR `DRF8BIT_5`).
+  `projection`, `raw_code_paths` and `BufrFile.source_structure` do not list
+  these fields.
 - `_data_category` (`float64`) is the message's data category; `iter_batches`
   batches also carry `_source_message_index` and `_source_subset_index`.
 
