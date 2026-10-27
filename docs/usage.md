@@ -99,14 +99,15 @@ with earth2bufr.open_bufr("crisf4.bufr") as source:
 Matching entries keep source order, duplicates and list boundaries.
 
 A batch holds at most `messages_per_batch` data messages (512 unless
-`target_decoded_bytes` is given), in source order, and ends early where the data category, descriptor template, compression or table
-epoch changes. Decoding runs on a background thread, ahead of the consumer
-and in source order; `prefetch_batches` is how many batches it decodes ahead
-of the one last returned. A decode error is raised by the `next()` call that
-would have returned that batch. Its message starts with `Source BUFR message N:`,
-the source message index of the failing message, or `Source BUFR message group
-A..B:`, the first and last index of the messages decoded with it. `read_bufr`
-decode errors start the same way.
+`target_decoded_bytes` is given), in source order, and ends early where the
+data category, descriptor template, compression or table epoch changes.
+Decoding runs on a background thread, ahead of the consumer and in source order;
+`prefetch_batches` is how many batches it decodes ahead of the one last returned.
+A decode error is raised by the `next()` call that would have returned that
+batch. Its message starts with `Source BUFR message N:`, the source message
+index of the failing message, or `Source BUFR message group A..B:`, the first
+and last index of the messages decoded with it. `read_bufr` decode errors start
+the same way.
 Dropping the iterator waits for its current decode and stops the background
 thread. An iterator may be advanced from any thread, one call at a time.
 
