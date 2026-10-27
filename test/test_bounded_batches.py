@@ -333,6 +333,23 @@ def test_bytcnt_frame_bounds_a_field_that_overruns_its_subset(tmp_path: Path, st
 
 
 @pytest.mark.rust
+def test_decoded_byte_target_without_message_cap(tmp_path: Path):
+    """With a byte target and no messages_per_batch, a batch after calibration takes every message."""
+    import earth2bufr
+
+    message = build_flat_wmo_message(surface_observation_case())
+    path = _write_messages(tmp_path, "many_messages.bufr", [message] * 600)
+
+    with earth2bufr.open_bufr(path) as source:
+        targeted = list(source.iter_batches(target_decoded_bytes=1 << 30))
+        default = list(source.iter_batches())
+
+    rows_per_message = targeted[0].num_rows
+    assert [batch.num_rows // rows_per_message for batch in targeted] == [1, 599]
+    assert [batch.num_rows // rows_per_message for batch in default] == [512, 88]
+
+
+@pytest.mark.rust
 def test_decoded_byte_target_calibrates_then_respects_message_cap(tmp_path: Path):
     """Adaptive groups preserve messages and retain an independent hard cap."""
     import earth2bufr

@@ -385,7 +385,7 @@ class BufrFile:
     def iter_batches(
         self,
         *,
-        messages_per_batch: int = 512,
+        messages_per_batch: int | None = None,
         projection: list[str] | None = None,
         raw_code_paths: list[str] | None = None,
         data_category_filter: list[int] | None = None,
@@ -406,8 +406,9 @@ class BufrFile:
 
         Parameters
         ----------
-        messages_per_batch : int, default 512
-            Maximum data messages per batch.
+        messages_per_batch : int, optional
+            Maximum data messages per batch. Defaults to 512, or to no limit
+            when ``target_decoded_bytes`` is given.
         projection : list of str, optional
             Fields to keep. Flat mode accepts ``FIELD`` and ``FIELD.CHILD``;
             structural mode accepts paths of any depth.
@@ -433,7 +434,7 @@ class BufrFile:
             Soft budget for decoded Arrow bytes per batch, calibrated on the
             first message of each template and refreshed from each decoded
             batch. A batch also stops once its encoded message bytes reach the
-            budget. Messages are never split; a batch still stops at
+            budget. Messages are never split; a batch still stops at a given
             ``messages_per_batch``. Batches are then decoded one at a time, and
             the batches decoded ahead, counting the one being decoded, hold
             about ``prefetch_batches * target_decoded_bytes``.

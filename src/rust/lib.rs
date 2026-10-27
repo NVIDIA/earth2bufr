@@ -7311,6 +7311,10 @@ thread_local! {
 /// Message grouping and decode options of one `iter_batches` call, owned by
 /// the prefetch thread once iteration starts, or by the iterator when the
 /// decode pool has one thread.
+/// Messages per batch when neither `messages_per_batch` nor a byte target is
+/// given.
+const DEFAULT_MESSAGES_PER_BATCH: usize = 512;
+
 struct BatchPlanner {
     state: Arc<BufrFileState>,
     message_indices: Vec<usize>,
@@ -7971,7 +7975,7 @@ impl BufrFileHandle {
     #[allow(clippy::too_many_arguments)]
     fn iter_batches(
         &self,
-        messages_per_batch: usize,
+        messages_per_batch: Option<usize>,
         projection: Option<Vec<String>>,
         raw_code_paths: Option<Vec<String>>,
         data_category_filter: Option<Vec<u8>>,
@@ -7991,7 +7995,7 @@ impl BufrFileHandle {
             projection_missing,
         )
         .map_err(PyValueError::new_err)?;
-        if messages_per_batch == 0 {
+        if messages_per_batch == Some(0) {
             return Err(PyValueError::new_err(
                 "messages_per_batch must be greater than zero",
             ));
@@ -8023,7 +8027,10 @@ impl BufrFileHandle {
             state: Arc::clone(&self.state),
             message_indices,
             cursor: 0,
-            messages_per_batch,
+            messages_per_batch: messages_per_batch.unwrap_or(match target_decoded_bytes {
+                Some(_) => usize::MAX,
+                None => DEFAULT_MESSAGES_PER_BATCH,
+            }),
             target_decoded_bytes,
             estimated_template_index: None,
             estimated_bytes_per_subset: None,

@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RAYON_NUM_THREADS` and `set_num_threads` still set any count
 - Split uncompressed batches into parallel chunks of at least 128 KiB of
   messages instead of 1 MiB, so PrepBUFR and GPS-RO batches use more threads
+- `iter_batches` with `target_decoded_bytes` and no `messages_per_batch` no
+  longer caps batches at 512 messages
 
 ### Deprecated
 

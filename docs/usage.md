@@ -98,8 +98,8 @@ with earth2bufr.open_bufr("crisf4.bufr") as source:
 
 Matching entries keep source order, duplicates and list boundaries.
 
-A batch holds at most `messages_per_batch` data messages, in source order, and
-ends early where the data category, descriptor template, compression or table
+A batch holds at most `messages_per_batch` data messages (512 unless
+`target_decoded_bytes` is given), in source order, and ends early where the data category, descriptor template, compression or table
 epoch changes. Decoding runs on a background thread, ahead of the consumer
 and in source order; `prefetch_batches` is how many batches it decodes ahead
 of the one last returned. A decode error is raised by the `next()` call that
@@ -234,8 +234,9 @@ with earth2bufr.open_bufr(path) as source:
 `messages_per_batch` bounds a batch by message count. `target_decoded_bytes`
 also bounds it by decoded Arrow bytes: the first message of each template
 calibrates bytes per subset, each later batch of that template is sized from
-the batch decoded before it, a batch also stops once its encoded message bytes
-reach the target, and `messages_per_batch` stays the hard cap. Batches
+the batch decoded before it, and a batch also stops once its encoded message
+bytes reach the target. A `messages_per_batch` given with a byte target stays a
+hard cap; without one, batches have no message limit. Batches
 are then decoded one at a time, and the batches decoded ahead, counting the one
 being decoded, hold about `prefetch_batches * target_decoded_bytes`:
 
