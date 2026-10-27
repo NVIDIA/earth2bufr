@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decode values with a negative scale exactly by multiplying by a power of ten:
+  ATMS `SCCF` channel 1 is `2.38e10` Hz, not `23799999999.999996`; such values
+  change by at most 1 ulp
+
 ### Security
 
 ## [0.1.1] - 2026-10-26

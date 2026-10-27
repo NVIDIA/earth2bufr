@@ -45,6 +45,7 @@ from synthetic.builders import (
     build_fixed_replication_operator_message,
     build_flat_wmo_message,
     build_ncep_padded_messages,
+    build_negative_scale_messages,
     build_nested_delayed_replication_message,
     build_nested_fixed_replication_message,
     build_synthetic_prepbufr_ia5_message,
@@ -338,6 +339,29 @@ def test_ncep_subset_framing_is_not_output(tmp_path: Path, compressed: bool, fix
     assert [occurrence["mnemonic"] for occurrence in structure["effective_occurrences"]] == ["VAL"]
     (one_shot,) = earth2bufr.read_bufr(path, fixed_replication=fixed_replication)
     assert one_shot.schema.names == ["VAL", "_data_category"]
+
+
+@pytest.mark.rust
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("fixed_replication", ["flat", "structural"])
+def test_negative_scale_decodes_exactly(tmp_path: Path, compressed: bool, fixed_replication: str):
+    """A negative scale multiplies by a power of ten: raw 238000 at scale -5 is exactly 2.38e10."""
+    import earth2bufr
+
+    messages = build_negative_scale_messages([(238000, 1903100), (1903100, 238000)], compressed=compressed)
+    path = _write_messages(tmp_path, "negative_scale.bufr", list(messages))
+
+    with earth2bufr.open_bufr(path) as source:
+        (batch,) = source.iter_batches(fixed_replication=fixed_replication)
+        (filtered,) = source.iter_batches(
+            projection=["DRF8BIT"],
+            raw_code_paths=["DRF8BIT.FREQ"],
+            list_filters=[earth2bufr.ListValueFilter("DRF8BIT", "FREQ", [2.38e10])],
+        )
+
+    assert _column(batch, "FREQ").to_pylist() == [2.38e10, 1.9031e11]
+    assert pc.list_flatten(_column(batch, "DRF8BIT")).field("FREQ").to_pylist() == [1.9031e11, 2.38e10]
+    assert pc.list_flatten(_column(filtered, "DRF8BIT")).field("FREQ").to_pylist() == [238000]
 
 
 @pytest.mark.rust

@@ -582,6 +582,45 @@ def build_ncep_padded_messages(values: Sequence[int], *, compressed: bool) -> tu
     return dx_message, data_message
 
 
+def build_negative_scale_messages(rows: Sequence[tuple[int, int]], *, compressed: bool) -> tuple[bytes, bytes]:
+    """Build a DX-table message and a data message of (FREQ, DRF8BIT[FREQ]) subsets.
+
+    FREQ is packed as NCEP ATMS channel frequencies (SCCF): 26 bits at scale -5,
+    so raw 238000 is 2.38e10 Hz. Each row gives the raw top-level and listed value.
+    """
+    payload = bytearray()
+    payload.append(0)  # Table A entries
+    payload.append(2)  # Table B entries
+    payload += _dx_table_b_entry(0, 63, 2, "FREQ", "Synthetic frequency", "HZ", -5, 0, 26)
+    payload += _dx_table_b_entry(0, 31, 1, "DRF8BIT", "Delayed replication factor", "NUMERIC", 0, 0, 8)
+    payload.append(0)  # Table D entries
+    dx_message = bufr_message([], bytes(payload), num_subsets=1, data_category=11)
+
+    writer = BitWriter()
+    if compressed:
+        columns = (([row[0] for row in rows], 26), ([1] * len(rows), 8), ([row[1] for row in rows], 26))
+        for values, width in columns:
+            reference = min(values)
+            increment_bits = max(value - reference for value in values).bit_length()
+            writer.write_bits(reference, width)
+            writer.write_bits(increment_bits, 6)
+            for value in values:
+                writer.write_bits(value - reference, increment_bits)
+    else:
+        for top, listed in rows:
+            writer.write_bits(top, 26)
+            writer.write_bits(1, 8)
+            writer.write_bits(listed, 26)
+    data_message = bufr_message(
+        [desc(0, 63, 2), desc(1, 1, 0), desc(0, 31, 1), desc(0, 63, 2)],
+        writer.to_bytes(),
+        num_subsets=len(rows),
+        data_category=102,
+        compressed=compressed,
+    )
+    return dx_message, data_message
+
+
 def build_restated_message_type_messages() -> bytes:
     """Build a DX table whose Table A names SYNOBS, then a data message whose Section 3 lists SYNOBS
     followed by its own members again, as NCEP GOES radiance dumps do. The data holds SYNOBS once."""

@@ -2042,6 +2042,33 @@ fn uses_missing_value(descriptor: u32) -> bool {
     ((descriptor >> 8) & 0x3F) != 31
 }
 
+/// A BUFR decimal scale: the physical value is `unscaled * 10^-scale`. A
+/// negative scale multiplies by an exact power of ten rather than dividing by
+/// the inexact `10^scale` (`238 * 1e8`, not `238 / 1e-8`).
+#[derive(Clone, Copy)]
+struct DecimalScale {
+    power: f64,
+    multiply: bool,
+}
+
+impl DecimalScale {
+    fn new(scale: i32) -> Self {
+        Self {
+            power: 10f64.powi(scale.abs()),
+            multiply: scale < 0,
+        }
+    }
+
+    #[inline]
+    fn apply(self, unscaled: i64) -> f64 {
+        if self.multiply {
+            unscaled as f64 * self.power
+        } else {
+            unscaled as f64 / self.power
+        }
+    }
+}
+
 /// The all-ones value of a `num_bits`-wide field, the BUFR missing value.
 fn all_ones(num_bits: u32) -> u64 {
     if num_bits >= 64 {
@@ -2776,7 +2803,7 @@ fn stream_scalar_value(
                     b.append_null();
                 } else {
                     let scaled =
-                        (entry.reference_value + raw as i64) as f64 / 10f64.powi(entry.scale);
+                        DecimalScale::new(entry.scale).apply(entry.reference_value + raw as i64);
                     b.append_value(scaled);
                 }
             }
@@ -2945,8 +2972,8 @@ fn stream_replication(
                         } else {
                             match output {
                                 NumericOutput::PhysicalFloat64 => {
-                                    let scaled =
-                                        (*reference_value + raw as i64) as f64 / 10f64.powi(*scale);
+                                    let scaled = DecimalScale::new(*scale)
+                                        .apply(*reference_value + raw as i64);
                                     struct_builder
                                         .field_builder::<Float64Builder>(field_idx)
                                         .ok_or_else(|| {
@@ -3027,8 +3054,8 @@ fn stream_replication(
                             } else {
                                 match output {
                                     NumericOutput::PhysicalFloat64 => {
-                                        let scaled = (entry.reference_value + raw as i64) as f64
-                                            / 10f64.powi(entry.scale);
+                                        let scaled = DecimalScale::new(entry.scale)
+                                            .apply(entry.reference_value + raw as i64);
                                         struct_builder
                                             .field_builder::<Float64Builder>(field_idx)
                                             .ok_or_else(|| {
@@ -3136,8 +3163,8 @@ fn stream_nested_struct(
                             })?
                             .append_null();
                     } else {
-                        let scaled =
-                            (entry.reference_value + raw as i64) as f64 / 10f64.powi(entry.scale);
+                        let scaled = DecimalScale::new(entry.scale)
+                            .apply(entry.reference_value + raw as i64);
                         struct_builder
                             .field_builder::<Float64Builder>(field_idx)
                             .ok_or_else(|| {
@@ -4961,7 +4988,7 @@ fn parse_list_value_filters(
 #[derive(Clone, Copy)]
 enum KeyValues {
     Physical,
-    RawCode { reference: i64, divisor: f64 },
+    RawCode { reference: i64, scale: DecimalScale },
 }
 
 /// Index of the filter key among the struct children of a `List<Struct>`
@@ -4995,7 +5022,7 @@ fn list_filter_key_index(
                 key,
                 KeyValues::RawCode {
                     reference,
-                    divisor: 10f64.powi(scale),
+                    scale: DecimalScale::new(scale),
                 },
             ))
         }
@@ -5015,9 +5042,9 @@ fn filter_list_struct_values(
     let physical = |index: usize| -> f64 {
         match key_values {
             KeyValues::Physical => keys.as_primitive::<Float64Type>().value(index),
-            KeyValues::RawCode { reference, divisor } => {
+            KeyValues::RawCode { reference, scale } => {
                 let code = keys.as_primitive::<Int32Type>().value(index);
-                (reference + i64::from(code)) as f64 / divisor
+                scale.apply(reference + i64::from(code))
             }
         }
     };
@@ -5530,8 +5557,8 @@ fn is_zero_width(item: &ExpandedItem) -> bool {
 }
 
 #[inline]
-fn physical_value(entry: &TableBEntry, divisor: f64, code: u64) -> f64 {
-    (entry.reference_value + code as i64) as f64 / divisor
+fn physical_value(entry: &TableBEntry, scale: DecimalScale, code: u64) -> f64 {
+    scale.apply(entry.reference_value + code as i64)
 }
 
 /// Step over one compressed item without storing it. Strict mode still
@@ -5736,7 +5763,7 @@ fn count_filtered_list(
             match item {
                 ExpandedItem::Descriptor(descriptor, entry) if index == filter.key => {
                     element[node.id - items_id] += 1;
-                    let divisor = 10f64.powi(entry.scale);
+                    let scale = DecimalScale::new(entry.scale);
                     let mut last: Option<(Option<u64>, bool)> = None;
                     for_each_compressed_code(
                         reader,
@@ -5749,7 +5776,7 @@ fn count_filtered_list(
                                 _ => {
                                     let keep = code.is_some_and(|code| {
                                         filter.values.contains(&numeric_filter_bits(
-                                            physical_value(entry, divisor, code),
+                                            physical_value(entry, scale, code),
                                         ))
                                     });
                                     last = Some((code, keep));
@@ -6285,7 +6312,7 @@ fn decode_compressed_into_slots(
                 ExpandedItem::Descriptor(descriptor, entry),
                 ColumnSlot::Float64 { window, positions },
             ) if !entry.is_string => {
-                let divisor = 10f64.powi(entry.scale);
+                let scale = DecimalScale::new(entry.scale);
                 place_compressed_codes(
                     reader,
                     entry.bit_width,
@@ -6293,7 +6320,7 @@ fn decode_compressed_into_slots(
                     n,
                     positions.place(kept)?,
                     |index, code| {
-                        window.write(index, code.map(|code| physical_value(entry, divisor, code)))
+                        window.write(index, code.map(|code| physical_value(entry, scale, code)))
                     },
                 );
             }
