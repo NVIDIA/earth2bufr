@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   messages instead of 1 MiB, so PrepBUFR and GPS-RO batches use more threads
 - `iter_batches` with `target_decoded_bytes` and no `messages_per_batch` no
   longer caps batches at 512 messages
+- Fill the `_source_message_index`, `_source_subset_index` and `_data_category`
+  columns in parallel
 
 ### Deprecated
 

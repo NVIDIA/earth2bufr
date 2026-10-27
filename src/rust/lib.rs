@@ -4869,15 +4869,20 @@ fn append_source_provenance(
         return Err("Decoded schema collides with source provenance fields".into());
     }
 
-    let mut source_messages: Vec<u64> = Vec::with_capacity(batch.num_rows());
-    let mut source_subsets: Vec<u32> = Vec::with_capacity(batch.num_rows());
-    for (message_index, subset_count) in message_indices.iter().zip(subset_counts) {
-        source_messages.extend(std::iter::repeat_n(
-            *message_index as u64,
-            *subset_count as usize,
-        ));
-        source_subsets.extend(0..u32::from(*subset_count));
-    }
+    let rows = subset_counts.iter().map(|count| usize::from(*count)).sum();
+    let mut source_messages = vec![0_u64; rows];
+    let mut source_subsets = vec![0_u32; rows];
+    let lengths = || subset_counts.iter().map(|count| usize::from(*count));
+    split_by_lengths(&mut source_messages, lengths())
+        .into_par_iter()
+        .zip(split_by_lengths(&mut source_subsets, lengths()))
+        .zip(message_indices)
+        .for_each(|((messages, subsets), &message_index)| {
+            messages.fill(message_index as u64);
+            for (subset, slot) in subsets.iter_mut().enumerate() {
+                *slot = subset as u32;
+            }
+        });
     if source_messages.len() != batch.num_rows() {
         return Err(format!(
             "Decoded {} rows but provenance describes {} rows",
@@ -6730,11 +6735,15 @@ impl MessageGroup<'_> {
     }
 }
 
+/// Rows per parallel task when filling a constant column.
+const CONSTANT_FILL_CHUNK: usize = 1 << 16;
+
 fn with_data_category(mut arrays: Vec<ArrayRef>, data_category: u8, rows: usize) -> Vec<ArrayRef> {
-    arrays.push(Arc::new(Float64Array::from_value(
-        data_category as f64,
-        rows,
-    )));
+    let mut values = vec![0.0; rows];
+    values
+        .par_chunks_mut(CONSTANT_FILL_CHUNK)
+        .for_each(|chunk| chunk.fill(f64::from(data_category)));
+    arrays.push(Arc::new(Float64Array::from(values)));
     arrays
 }
 
