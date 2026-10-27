@@ -7317,13 +7317,13 @@ thread_local! {
         .ok();
 }
 
-/// Message grouping and decode options of one `iter_batches` call, owned by
-/// the prefetch thread once iteration starts, or by the iterator when the
-/// decode pool has one thread.
 /// Messages per batch when neither `messages_per_batch` nor a byte target is
 /// given.
 const DEFAULT_MESSAGES_PER_BATCH: usize = 512;
 
+/// Message grouping and decode options of one `iter_batches` call, owned by
+/// the prefetch thread once iteration starts, or by the iterator when the
+/// decode pool has one thread.
 struct BatchPlanner {
     state: Arc<BufrFileState>,
     message_indices: Vec<usize>,
