@@ -356,7 +356,7 @@ def test_negative_scale_decodes_exactly(tmp_path: Path, compressed: bool, fixed_
         (filtered,) = source.iter_batches(
             projection=["DRF8BIT"],
             raw_code_paths=["DRF8BIT.FREQ"],
-            list_filters=[earth2bufr.ListValueFilter("DRF8BIT", "FREQ", [2.38e10])],
+            list_filters=[earth2bufr.ListValueFilter("DRF8BIT", "FREQ", (2.38e10,))],
         )
 
     assert _column(batch, "FREQ").to_pylist() == [2.38e10, 1.9031e11]
