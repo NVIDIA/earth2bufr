@@ -17,13 +17,13 @@ dfs = earth2bufr.read_bufr("observations.bufr", as_pandas=True)
 # Keep some fields; unknown fields raise
 batches = earth2bufr.read_bufr(
     "observations.bufr",
-    projection=["B012101", "B010004", "B011002"]  # air temperature, pressure, wind speed
+    projection=["B012101", "B010004", "B011002"],  # air temperature, pressure, wind speed
 )
 
 # Filter by WMO data category
 batches = earth2bufr.read_bufr(
     "observations.bufr",
-    data_category_filter=[0, 1]  # surface land, surface sea
+    data_category_filter=[0, 1],  # surface land, surface sea
 )
 ```
 
@@ -144,7 +144,7 @@ A template with none of the projected fields gives batches with only
 
 ```python
 earth2bufr.set_num_threads(16)
-earth2bufr.get_num_threads()   # 16
+earth2bufr.get_num_threads()  # 16
 ```
 
 Decoding runs on its own thread pool. Without a `set_num_threads` call, its size
@@ -170,7 +170,7 @@ mnemonics, the result has repeated column names:
 with earth2bufr.open_bufr("gdas.t00z.1bamua.tm00.bufr_d") as source:
     batch = next(iter(source.iter_batches()))
 
-batch.schema.names.count("TMBR")   # 15 -- one per AMSU-A channel, all named "TMBR"
+batch.schema.names.count("TMBR")  # 15 -- one per AMSU-A channel, all named "TMBR"
 ```
 
 Looking a repeated name up raises in pyarrow (`batch.column("TMBR")`) and returns
@@ -184,9 +184,9 @@ with earth2bufr.open_bufr("gdas.t00z.1bamua.tm00.bufr_d") as source:
     batch = next(iter(source.iter_batches(fixed_replication="structural")))
 
 column = batch.column(batch.schema.get_field_index("fixed_1_01_015__occ_0"))
-footprint = column[0].as_py()          # 15 entries
-[entry["CHNM"] for entry in footprint] # [1.0, 2.0, ..., 15.0]
-[entry["TMBR"] for entry in footprint] # the matching brightness temperatures
+footprint = column[0].as_py()  # 15 entries
+[entry["CHNM"] for entry in footprint]  # [1.0, 2.0, ..., 15.0]
+[entry["TMBR"] for entry in footprint]  # the matching brightness temperatures
 ```
 
 The values are identical between the two modes; only the shape differs.
@@ -241,8 +241,8 @@ being decoded, hold about `prefetch_batches * target_decoded_bytes`:
 ```python
 with earth2bufr.open_bufr("gdas.t00z.crisf4.tm00.bufr_d") as source:
     for batch in source.iter_batches(
-        target_decoded_bytes=256 << 20,   # aim for ~256 MiB per batch
-        messages_per_batch=2048,          # never exceed this many messages
+        target_decoded_bytes=256 << 20,  # aim for ~256 MiB per batch
+        messages_per_batch=2048,  # never exceed this many messages
         fixed_replication="structural",
     ):
         ...
@@ -432,9 +432,9 @@ BUFR message or a header cannot be read.
 ```python
 info = earth2bufr.get_metadata("observations.bufr")
 
-info.messages           # MessageInfo for every message, including DX table and empty messages
-info.data_messages      # messages that carry subsets
-info.table_epochs       # TableEpoch per table set
+info.messages  # MessageInfo for every message, including DX table and empty messages
+info.data_messages  # messages that carry subsets
+info.table_epochs  # TableEpoch per table set
 for message in info.data_messages:
     print(message.source_message_index, message.offset, message.size_bytes)
     print(message.data_category, message.local_sub_category, message.center)
@@ -489,17 +489,10 @@ Use custom BUFR descriptor tables for non-standard or local descriptors:
 
 ```python
 # Load custom tables from JSON files
-table_b_json, table_d_json = earth2bufr.load_tables(
-    table_b_path="my_table_b.json",
-    table_d_path="my_table_d.json"
-)
+table_b_json, table_d_json = earth2bufr.load_tables(table_b_path="my_table_b.json", table_d_path="my_table_d.json")
 
 # Read with custom tables
-batches = earth2bufr.read_bufr(
-    "observations.bufr",
-    table_b_json=table_b_json,
-    table_d_json=table_d_json
-)
+batches = earth2bufr.read_bufr("observations.bufr", table_b_json=table_b_json, table_d_json=table_d_json)
 
 # Add local table overrides for a specific centre
 local_json = earth2bufr.create_local_tables(
@@ -515,8 +508,5 @@ local_json = earth2bufr.create_local_tables(
     }
 )
 
-batches = earth2bufr.read_bufr(
-    "observations.bufr",
-    local_tables_json=local_json
-)
+batches = earth2bufr.read_bufr("observations.bufr", local_tables_json=local_json)
 ```
